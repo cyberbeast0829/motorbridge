@@ -159,6 +159,10 @@ pub extern "C" fn motor_handle_send_pos_vel(
                 .send_pos_control(
                     target_position * (180.0 / PI),
                     velocity_limit.abs() * (60.0 / (2.0 * PI)),
+                    // cur_limit：0.0 = 「未指定」，由 vendor crate 兜底为
+                    // DEFAULT_CMD_CURRENT_LIMIT。⚠️ 不要改回「0.0 就是不限制」的理解 ——
+                    // 固件收到 0 会把扭矩闸门拧死，连带废掉 MIT/力矩等所有模式。
+                    // 见 motor_vendors/cyberbeast/src/motor.rs 中 DEFAULT_CMD_CURRENT_LIMIT 的注释。
                     0.0,
                 )
                 .map_err(|e| e.to_string()),
@@ -218,8 +222,13 @@ pub extern "C" fn motor_handle_send_vel(motor: *mut MotorHandle, target_velocity
             MotorHandleInner::Robstride(m) => m
                 .set_velocity_target(target_velocity)
                 .map_err(|e| e.to_string()),
+            // ⚠️ 2026-09-20 修正：此处原为 `target_velocity.abs()`，会把反向速度
+            // 静默转成正向。其余厂商（Damiao/Robstride/MyActuator/Hightorque）
+            // 均原样透传 target_velocity，CyberBeast 是唯一的例外，故去掉 .abs()。
             MotorHandleInner::CyberBeast(m) => m
-                .send_vel_control(target_velocity.abs() * (60.0 / (2.0 * PI)), 0.0)
+                // cur_limit：0.0 = 「未指定」，由 vendor crate 兜底为
+                // DEFAULT_CMD_CURRENT_LIMIT（理由见上方 send_pos_vel 分支的注释）
+                .send_vel_control(target_velocity * (60.0 / (2.0 * PI)), 0.0)
                 .map_err(|e| e.to_string()),
             MotorHandleInner::Hightorque(m) => {
                 m.send_cmd_vel(target_velocity).map_err(|e| e.to_string())
@@ -249,9 +258,16 @@ pub extern "C" fn motor_handle_send_force_pos(
             MotorHandleInner::Robstride(_) => {
                 Err("send_force_pos is not supported for RobStride".to_string())
             }
-            MotorHandleInner::CyberBeast(m) => m
-                .send_torque_control(torque_limit_ratio * m.mit_torque_limit)
-                .map_err(|e| e.to_string()),
+            // ⚠️ 2026-09-20 修正：此处原为
+            //     `m.send_torque_control(torque_limit_ratio * m.mit_torque_limit)`
+            // 它收了 target_position / velocity_limit 却完全不用，静默把「力位混合
+            // 控制」变成一条纯力矩指令 —— 调用方拿不到任何错误信号。
+            // CyberBeast 协议里也没有能同时表达「位置 + 速度限 + 力矩限」的单帧
+            // （POS 帧携带的是位置 + 速度限 + **电流**限，不是力位混合）。
+            // 故与 Robstride / MyActuator / Hexfellow 对齐：显式失败而非静默做错事。
+            MotorHandleInner::CyberBeast(_) => {
+                Err("send_force_pos is not supported for CyberBeast".to_string())
+            }
             MotorHandleInner::Hightorque(m) => m
                 .send_cmd_force_pos(target_position, velocity_limit, torque_limit_ratio)
                 .map_err(|e| e.to_string()),

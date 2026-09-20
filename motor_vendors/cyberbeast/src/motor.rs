@@ -133,6 +133,56 @@ const DEFAULT_MIT_TORQUE_LIMIT: f32 = 18.0; // ±18 N·m
 const DEFAULT_MIT_CURRENT_LIMIT: f32 = 40.0; // ± A (for response decoding)
 
 // ============================================================================
+// 命令侧电流限兜底值
+// ============================================================================
+
+/// `send_pos_control` / `send_vel_control` 的 `cur_limit_a` 兜底值（A）。
+///
+/// 调用者传入 `<= 0.0`（含 NaN）时视为「未指定」，改用本值。**不要传 0.0 表示「不限制」。**
+///
+/// # 为什么必须有这个兜底
+///
+/// 固件把这一参数**直接写进一个跨模式生效的全局配置**：
+///
+/// ```text
+/// axis.motor_.config_.torque_lim = cur_limit_a * torque_constant
+///     // can_cyberbeast.cpp:456 (cmd_pos_control) / :492 (cmd_vel_control)
+/// ```
+///
+/// 而 `torque_lim` 是**所有控制模式的公共闸门**：
+///
+/// ```text
+/// controller.cpp:330-331   Tlim = max_available_torque();
+///                          torque_setpoint_ = clamp(torque_setpoint_, -Tlim, Tlim);
+/// motor.cpp:400-401        max_torque = clamp(max_torque, 0.0, config_.torque_lim);
+/// ```
+///
+/// ⇒ 传入 0 会把闸门拧死成 `clamp(x, 0, 0) == 0`，**连带废掉 MIT / 力矩等所有模式**，
+/// 且报错码仍为 `0x00`（无错误），**必须断电重启才能恢复**（该值驻留 RAM，不写 Flash）。
+///
+/// 已在 2026-09-20 用四阶段对照实验实测复现，详见
+/// `docs/cyberbeast-三模式实测报告.md` 第九节。
+///
+/// # 取值依据
+///
+/// `200.0` 与 `motor_cli` 的 `--cur-limit` 默认值一致（该值已实测跑通）。
+/// 效果上等于「不额外加扭矩限制」—— 固件的 `current_lim`（板级默认 60A，
+/// `paras.h:48`）仍会先兜住，因此不会放大过流风险。
+pub const DEFAULT_CMD_CURRENT_LIMIT: f32 = 200.0;
+
+/// 把「未指定」的电流限解析成可用值。
+///
+/// `<= 0.0`（含 NaN）→ [`DEFAULT_CMD_CURRENT_LIMIT`]；否则原样返回。
+#[inline]
+fn resolve_cur_limit(cur_limit_a: f32) -> f32 {
+    if cur_limit_a > 0.0 {
+        cur_limit_a
+    } else {
+        DEFAULT_CMD_CURRENT_LIMIT
+    }
+}
+
+// ============================================================================
 // Motor state
 // ============================================================================
 
@@ -360,14 +410,19 @@ impl CyberBeastMotor {
     ///
     /// - `target_pos_deg`: target position in degrees
     /// - `vel_limit_rpm`: velocity limit in RPM
-    /// - `cur_limit_a`: current limit in Amps
+    /// - `cur_limit_a`: current limit in Amps.
+    ///   **`<= 0.0`（含 NaN）表示「未指定」，将使用 [`DEFAULT_CMD_CURRENT_LIMIT`]。**
     pub fn send_pos_control(
         &self,
         target_pos_deg: f32,
         vel_limit_rpm: f32,
         cur_limit_a: f32,
     ) -> Result<()> {
-        let data = encode_pos_control(target_pos_deg, vel_limit_rpm, cur_limit_a);
+        let data = encode_pos_control(
+            target_pos_deg,
+            vel_limit_rpm,
+            resolve_cur_limit(cur_limit_a),
+        );
         let can_id = self.cmd_can_id(Priority::Ctrl, MsgType::PosControl);
         self.send_ext(can_id, data)
     }
@@ -375,9 +430,10 @@ impl CyberBeastMotor {
     /// Send velocity control command (output-side units).
     ///
     /// - `target_vel_rpm`: target velocity in RPM
-    /// - `cur_limit_a`: current limit in Amps
+    /// - `cur_limit_a`: current limit in Amps.
+    ///   **`<= 0.0`（含 NaN）表示「未指定」，将使用 [`DEFAULT_CMD_CURRENT_LIMIT`]。**
     pub fn send_vel_control(&self, target_vel_rpm: f32, cur_limit_a: f32) -> Result<()> {
-        let data = encode_vel_control(target_vel_rpm, cur_limit_a);
+        let data = encode_vel_control(target_vel_rpm, resolve_cur_limit(cur_limit_a));
         let can_id = self.cmd_can_id(Priority::Ctrl, MsgType::VelControl);
         self.send_ext(can_id, data)
     }

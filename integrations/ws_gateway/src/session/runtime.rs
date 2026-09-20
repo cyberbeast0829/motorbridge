@@ -159,14 +159,28 @@ impl SessionCtx {
                 }) => motor
                     .send_mit_command(*pos, *vel, *kp, *kd, *tau)
                     .map_err(|e| e.to_string()),
+                // ⚠️ 2026-09-20 修正：此处原为 `vel.abs() * 60.0 / TWO_PI`，会把反向
+                // 速度静默转成正向。Damiao(:37) / Myactuator(:114) 均原样透传，
+                // CyberBeast 是唯一的例外。（同一修正见 motor_abi 的 send_vel 分支）
                 Some(ActiveCommand::Vel { vel }) => motor
-                    .send_vel_control(vel.abs() * 60.0 / TWO_PI, 0.0)
+                    .send_vel_control(*vel * 60.0 / TWO_PI, 0.0)
                     .map_err(|e| e.to_string()),
+                // `cur_limit = 0.0` 表示「调用者未指定」，由 vendor crate 兜底为
+                // DEFAULT_CMD_CURRENT_LIMIT —— 不要改回「0.0 就是不限制」的理解，
+                // 固件收到 0 会把扭矩闸门拧死，连带废掉 MIT / 力矩等所有模式。
+                // `vlim.abs()` 保留：那是速度**限幅**，是幅值不是方向，与 ABI 侧
+                // motor_handle_send_pos_vel 的处理一致。
                 Some(ActiveCommand::PosVel { pos, vlim }) => motor
                     .send_pos_control(pos * 360.0 / TWO_PI, vlim.abs() * 60.0 / TWO_PI, 0.0)
                     .map_err(|e| e.to_string()),
+                // ⚠️ 2026-09-20 修正：此处原为 `{ .. }` 丢弃 pos / vlim / ratio 全部参数，
+                // 再硬发 `send_torque_control(0.0)` —— 永远输出零力矩，且不告诉调用方
+                // 参数被忽略了。本模块内只有 Damiao(:39) 真正支持该模式，其余厂商
+                // （Hexfellow:73 / Hightorque:107 / Myactuator:118 / Robstride:147）
+                // 均显式报错。CyberBeast 与其对齐；同一决定见 motor_abi 的
+                // send_force_pos 分支。
                 Some(ActiveCommand::ForcePos { .. }) => {
-                    motor.send_torque_control(0.0).map_err(|e| e.to_string())
+                    Err("force_pos is not supported for cyberbeast".to_string())
                 }
                 None => Ok(()),
             },

@@ -109,7 +109,9 @@ pub fn run_cyberbeast(
             loop {
                 let pos = get_f32(args, "pos", 0.0)?;
                 let vel_limit = get_f32(args, "vel-limit", 100.0)?;
-                motor.send_pos_control(pos, vel_limit, 0.0)?;
+                // Current limit [A]. Default exceeds hardware max so the firmware torque_lim clamp is inert.
+                let cur_limit = get_f32(args, "cur-limit", 200.0)?;
+                motor.send_pos_control(pos, vel_limit, cur_limit)?;
                 let _ = ctrl.poll_feedback_once();
                 if let Some(state) = motor.latest_state() {
                     print!(
@@ -129,7 +131,9 @@ pub fn run_cyberbeast(
 
             loop {
                 let vel_rpm = get_f32(args, "vel", 0.0)?;
-                motor.send_vel_control(vel_rpm, 0.0)?;
+                // Current limit [A]. Default exceeds hardware max so the firmware torque_lim clamp is inert.
+                let cur_limit = get_f32(args, "cur-limit", 200.0)?;
+                motor.send_vel_control(vel_rpm, cur_limit)?;
                 let _ = ctrl.poll_feedback_once();
                 if let Some(state) = motor.latest_state() {
                     print!(
