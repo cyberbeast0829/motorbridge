@@ -290,7 +290,7 @@ flowchart LR
 ```mermaid
 flowchart TB
   PYAPP["Python App"] --> CTL["Controller(...) / from_socketcanfd(...) / from_dm_serial(...) / from_dm_device(...)"]
-  CTL --> ADD["add_damiao_motor / add_robstride_motor / add_myactuator_motor / add_hightorque_motor / add_hexfellow_motor"]
+  CTL --> ADD["add_damiao_motor / add_robstride_motor / add_myactuator_motor / add_hightorque_motor / add_hexfellow_motor / add_cyberbeast_motor"]
   ADD --> MOTOR["MotorHandle"]
   MOTOR --> CTRL1["send_mit / send_pos_vel / send_vel / send_force_pos"]
   MOTOR --> CTRL2["ensure_mode / enable / disable / set_zero / stop / clear_error"]
@@ -705,6 +705,7 @@ Interpretation:
   - RobStride: `motor_controller_add_robstride_motor(...)`
   - MyActuator: `motor_controller_add_myactuator_motor(...)`
   - HighTorque: `motor_controller_add_hightorque_motor(...)`
+  - CyberBeast: `motor_controller_add_cyberbeast_motor(...)` (classic CAN; SDO endpoints via `motor_handle_cyberbeast_get_param_f32` / `_write_param_f32`)
 - Python:
   - `motorbridge.abi_version()`
   - `motorbridge.abi_capabilities()`
@@ -716,6 +717,7 @@ Interpretation:
   - `Controller.add_robstride_motor(...)`
   - `Controller.add_myactuator_motor(...)`
   - `Controller.add_hightorque_motor(...)`
+  - `Controller.add_cyberbeast_motor(...)` (+ `Motor.cyberbeast_get_param_f32(...)` / `Motor.cyberbeast_write_param_f32(...)`)
 - C++:
   - `motorbridge::abi_version()`
   - `motorbridge::abi_capabilities_json()`

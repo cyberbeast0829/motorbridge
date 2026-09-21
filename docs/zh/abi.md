@@ -61,15 +61,16 @@ ABI 对外保持一套统一控制接口。
 - RobStride：`motor_controller_add_robstride_motor(...)`
 - MyActuator：`motor_controller_add_myactuator_motor(...)`
 - HighTorque：`motor_controller_add_hightorque_motor(...)`
+- CyberBeast：`motor_controller_add_cyberbeast_motor(...)`（仅经典 CAN 路径）
 
 ## 统一模式与厂商原生协议映射
 
-| 统一模式 | Damiao 原生 | Hexfellow 原生 | RobStride 原生 | MyActuator 原生 | HighTorque 原生 |
-|---|---|---|---|---|---|
-| `MIT` | `Mit` | 模式 `5` | `Mit` | 不支持 | 映射到原生 pos+vel+tqe |
-| `POS_VEL` | `PosVel` | 模式 `1` | 映射到 `Position`（`run_mode=1`，`limit_spd=0x7017`，`loc_ref=0x7016`） | `Position` 设定流程 | 映射到原生 pos+vel+tqe |
-| `VEL` | `Vel` | 不支持 | `Velocity` | `Velocity` 设定流程 | 映射到原生速度命令 |
-| `FORCE_POS` | `ForcePos` | 不支持 | 不支持 | 不支持 | 映射到原生 pos+vel+tqe |
+| 统一模式 | Damiao 原生 | Hexfellow 原生 | RobStride 原生 | MyActuator 原生 | HighTorque 原生 | CyberBeast 原生 |
+|---|---|---|---|---|---|---|
+| `MIT` | `Mit` | 模式 `5` | `Mit` | 不支持 | 映射到原生 pos+vel+tqe | `Mit` |
+| `POS_VEL` | `PosVel` | 模式 `1` | 映射到 `Position`（`run_mode=1`，`limit_spd=0x7017`，`loc_ref=0x7016`） | `Position` 设定流程 | 映射到原生 pos+vel+tqe | `Position`（速度限制成为速度上限） |
+| `VEL` | `Vel` | 不支持 | `Velocity` | `Velocity` 设定流程 | 映射到原生速度命令 | `Velocity` |
+| `FORCE_POS` | `ForcePos` | 不支持 | 不支持 | 不支持 | 映射到原生 pos+vel+tqe | 映射到原生力矩控制；只用比例系数（`torque = 比例 * 模型 MIT 力矩上限`） |
 
 行为约定：
 
@@ -77,6 +78,9 @@ ABI 对外保持一套统一控制接口。
 - 即使某厂商忽略部分参数，也保持统一函数签名不变。
 - 例如：HighTorque 支持 `send_mit(pos, vel, kp, kd, tau)` 统一签名，但原生协议不使用 `kp/kd`。
 - Hexfellow 的 ABI 路径支持 `MIT` 和 `POS_VEL`，`VEL` / `FORCE_POS` 会返回不支持。
+- CyberBeast 的 ABI 路径四个模式都支持（`MIT` / `POS_VEL` / `VEL` / `FORCE_POS`）。`feedback_id` 仅为签名兼容保留、协议不使用：命令与反馈帧都按 `motor_id`（8 位 CAN 节点 ID）寻址。
+- CyberBeast 的 `motor_handle_ensure_mode` 只校验统一模式码并发送 `START_MOTOR`；真正的模式由每帧控制指令携带（MIT / 位置 / 速度 / 力矩报文类型），不是写模式寄存器。
+- CyberBeast 的参数访问是 16 位 ODrive SDO 端点上的 float32 通路（`motor_handle_cyberbeast_get_param_f32` / `_write_param_f32`）；完整端点表需通过 `MSG_JSON_DESC_READ` 在运行期获取。
 - RobStride 的 ABI 路径支持 `POS_VEL`，语义映射为原生 Position：先设置 `run_mode=1`，再写 `limit_spd` 与 `loc_ref`。
 - RobStride 的统一高层目前支持 `MIT/POS_VEL/VEL`；`TORQUE/CURRENT` 仍是参数级能力（通过 `robstride_write_param_*`），尚未开放统一模式。
 - Damiao 置零顺序规则：先调用 `motor_handle_disable`，再调用 `motor_handle_set_zero_position`；否则会被核心防护拒绝。
@@ -101,6 +105,11 @@ RobStride 扩展接口：
 - `motor_handle_robstride_get_param_f32_host_id`
 - `motor_handle_robstride_write_param_i8/u8/u16/u32/f32`
 - `motor_handle_robstride_get_param_i8/u8/u16/u32/f32`
+
+CyberBeast 扩展接口（ODrive SDO 端点）：
+
+- `motor_handle_cyberbeast_get_param_f32(motor, param_id, timeout_ms, out_value)`
+- `motor_handle_cyberbeast_write_param_f32(motor, param_id, value)`（等待设备写确认，预算 200 ms）
 
 ## 典型调用顺序
 

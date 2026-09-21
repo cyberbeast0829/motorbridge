@@ -6,6 +6,7 @@
 - Linux SocketCAN uses prepared interfaces directly: `can0`, `can1`. For CANable, use candleLight/gs_usb firmware so it appears as a SocketCAN interface such as `can0`.
 - Use PCAN or CANable candleLight/gs_usb for standard CAN.
 - CAN-FD transport is available both in CLI (`--transport socketcanfd`) and Python SDK (`Controller.from_socketcanfd(...)`), and is required for Hexfellow.
+- CyberBeast has no CAN-FD transport: use the classic-CAN path (`Controller(channel)` / `--transport socketcan`), and do not attach it to a CAN-FD controller.
 - Damiao-only adapter transports are available in CLI: serial bridge (`--transport dm-serial --serial-port /dev/ttyACM0 --serial-baud 921600`) and DM_Device SDK (`--transport dm-device --dm-device-type usb2canfd|usb2canfd-dual|linkx4c --dm-channel 0|1|2|3`; Damiao motors only; adapter must be in USB mode).
 - Damiao-only DM_Device SDK transport is available in CLI
   (`--transport dm-device --dm-device-type usb2canfd|usb2canfd-dual|linkx4c`)
@@ -143,18 +144,20 @@ Packaging note:
   - MyActuator: `add_myactuator_motor(...)`
   - RobStride: `add_robstride_motor(...)`
   - HighTorque: `add_hightorque_motor(...)`
+  - CyberBeast: `add_cyberbeast_motor(...)` (classic CAN only; SDO endpoint access through `cyberbeast_get_param_f32(...)` / `cyberbeast_write_param_f32(...)`)
 - Unified state-query pattern:
   - Recommended flow: `request_feedback() -> poll_feedback_once() -> get_state()`.
   - RobStride has no single-shot private-protocol status request; `request_feedback()` is a non-blocking no-op for RobStride. Use `robstride_ping()` for connectivity, active report for streaming state, or typed parameter reads for fresh position/velocity values.
+  - CyberBeast exposes `request_feedback()` as `QUERY_STATUS`; MIT responses and heartbeats also refresh state through the background polling thread. `get_state()` maps motor current to `torq` and the two device temperatures to `t_mos`/`t_rotor`.
 
 ## Unified Mode Mapping Summary (Top-Level -> Vendor Native)
 
-| Unified Mode | Damiao | RobStride | Hexfellow | MyActuator | HighTorque |
-| --- | --- | --- | --- | --- | --- |
-| `Mode.MIT` | native MIT | native MIT | native MIT (mode 5) | unsupported | maps to native pos+vel+tqe |
-| `Mode.POS_VEL` | native POS_VEL | maps to native Position (`run_mode=1` + `limit_spd(0x7017)` + `loc_ref(0x7016)`) | native POS_VEL (mode 1) | Position setpoint flow | maps to native pos+vel+tqe |
-| `Mode.VEL` | native VEL | native Velocity | unsupported | native velocity setpoint flow | native velocity command |
-| `Mode.FORCE_POS` | native FORCE_POS | unsupported | unsupported | unsupported | maps to native pos+vel+tqe |
+| Unified Mode | Damiao | RobStride | Hexfellow | MyActuator | HighTorque | CyberBeast |
+| --- | --- | --- | --- | --- | --- | --- |
+| `Mode.MIT` | native MIT | native MIT | native MIT (mode 5) | unsupported | maps to native pos+vel+tqe | native MIT |
+| `Mode.POS_VEL` | native POS_VEL | maps to native Position (`run_mode=1` + `limit_spd(0x7017)` + `loc_ref(0x7016)`) | native POS_VEL (mode 1) | Position setpoint flow | maps to native pos+vel+tqe | native position control (`--vlim` maps to a speed limit) |
+| `Mode.VEL` | native VEL | native Velocity | unsupported | native velocity setpoint flow | native velocity command | native velocity control |
+| `Mode.FORCE_POS` | native FORCE_POS | unsupported | unsupported | unsupported | maps to native pos+vel+tqe | maps to native torque control; only `--ratio` is used (`torque = ratio * model MIT torque limit`) |
 
 Note:
 
@@ -162,6 +165,9 @@ Note:
 - Torque/current is parameter-level only for RobStride (`robstride_write_param_*`), not a dedicated unified mode.
 - RobStride feedback/host default should use `0xFD`; scan tries `0xFD,0xFF,0xFE,0x00,0xAA` by default.
 - RobStride `feedback_id` / `host_id` is not the motor `device_id`; scan hits report the motor ID as `probe` / `device_id`.
+- CyberBeast has no CAN-FD path: use `Controller(channel)` and keep `--transport socketcan` (`--transport socketcanfd` is refused for this vendor).
+- CyberBeast `feedback_id` is accepted for signature parity but ignored; feedback frames are addressed by `motor_id`.
+- CyberBeast `ensure_mode(mode, timeout_ms)` validates the unified mode code and starts the axis (`START_MOTOR`). The active mode itself rides on each control frame (MIT / position / velocity / torque message type), so no mode register is written.
 
 ## Quick Start
 
@@ -226,6 +232,23 @@ with Controller.from_socketcanfd("can0") as ctrl:
     ctrl.enable_all()
     motor.ensure_mode(Mode.MIT, 1000)      # Hexfellow supports MIT / POS_VEL
     motor.send_mit(0.8, 1.0, 30.0, 1.0, 0.1)
+    print(motor.get_state())
+    motor.close()
+```
+
+CyberBeast quick use (classic CAN + ODrive SDO endpoints):
+
+```python
+from motorbridge import Controller, EP_CONTROLLER_ERROR, Mode
+
+with Controller("can0") as ctrl:
+    motor = ctrl.add_cyberbeast_motor(0x01, 0x01, "odrive-default")
+    print(motor.cyberbeast_get_param_f32(EP_CONTROLLER_ERROR, 500))
+    ctrl.enable_all()                          # enable = AXIS_STATE_CLOSED_LOOP start
+    motor.ensure_mode(Mode.POS_VEL, 1000)      # validates the mode code and starts the axis
+    motor.send_pos_vel(0.5, 2.0)
+    motor.cyberbeast_write_param_f32(0x0039, 5.0)   # controller.config.vel_limit
+    motor.store_parameters()                   # CONFIG_SAVE
     print(motor.get_state())
     motor.close()
 ```
@@ -375,6 +398,7 @@ python -m pip install bindings/python/dist/motorbridge-*.whl
 
 - Damiao wrapper demo: `examples/python_wrapper_demo.py`
 - Hexfellow CAN-FD demo: `examples/hexfellow_canfd_demo.py` (MIT / POS_VEL only)
+- CyberBeast classic-CAN demo: `examples/cyberbeast_demo.py` (SDO endpoint read/write; MIT / POS_VEL / VEL / FORCE_POS)
 - Damiao maintenance demo: `examples/damiao_maintenance_demo.py`
 - Damiao register rw demo: `examples/damiao_register_rw_demo.py`
 - Damiao dm-serial demo: `examples/damiao_dm_serial_demo.py`
@@ -422,6 +446,12 @@ uses only the arguments that its native protocol understands.
 | HighTorque | `mit` | `--pos --vel --tau` | `--kp/--kd` are accepted for unified signature but ignored by `ht_can v1.5.5` |
 | Hexfellow | `mit` | `--pos --vel --kp --kd --tau` | CAN-FD path |
 | Hexfellow | `pos-vel` | `--pos --vlim` | CAN-FD path |
+| CyberBeast | `mit` | `--pos --vel --kp --kd --tau` | classic CAN path |
+| CyberBeast | `pos-vel` | `--pos --vlim` | classic CAN path; `--vlim` becomes the speed limit |
+| CyberBeast | `vel` | `--vel` | classic CAN path |
+| CyberBeast | `force-pos` | `--ratio` | torque only: `torque = ratio * 18 Nm`; `--pos/--vlim` are ignored (a warning is printed) |
+| CyberBeast | `read-param` / `write-param` | `--param-id --param-value --store` | 16-bit SDO endpoints, f32 only; `write-param` reads back and prints `requested`/`value`/`verified` |
+| CyberBeast | `enable` / `disable` / `clear-error` / `save` / `set-zero` | - | `enable` starts closed-loop control, `save` sends `CONFIG_SAVE` |
 
 For RobStride `pos-vel`, `--vel`, `--kd`, and `--tau` are intentionally
 ignored because the firmware path is parameter-based (`limit_spd`, `loc_kp`,
@@ -471,13 +501,16 @@ python3 bindings/python/examples/robstride_wrapper_demo.py \
 
 ## Notes
 
-- `id-dump` is a Damiao workflow; `id-set` supports Damiao and RobStride; `scan` supports `damiao|hexfellow|myactuator|robstride|hightorque|all`.
+- `id-dump` is a Damiao workflow; `id-set` supports Damiao and RobStride; `scan` supports `damiao|hexfellow|myactuator|robstride|hightorque|cyberbeast|all`.
 - For RobStride `id-set`, `--new-motor-id` changes `device_id`; `--feedback-id` remains the host-side ID.
 - RobStride `motor_id` / `device_id` is validated as `1..255`; `feedback_id` / `host_id` is validated as `0..255` to prevent silent `ctypes` truncation.
 - RobStride scan probes each `--feedback-ids` host_id exactly through host-id-specific ABI helpers; invalid host IDs are rejected instead of silently falling back.
+- CyberBeast CAN node IDs (`motor_id` / `feedback_id`) are validated as `0..255` for the same reason: the protocol carries them as 8-bit fields, so a larger value would be truncated inside the library.
+- CyberBeast scan walks node IDs and treats a status reply as a hit; the probe enables the axis, queries status, then disables it again.
 - Python CLI and Rust CLI are aligned for the production Damiao and RobStride workflows: scan, enable/disable, control, ID update, parameter read/write, RobStride clear-error, and RobStride active-report. Rust CLI still exposes deeper vendor-specific surfaces for HighTorque/MyActuator/Hexfellow debugging.
 - `Mode.MIT` and `send_force_pos` are not available for MyActuator in ABI wrapper.
 - Hexfellow supports `MIT` and `POS_VEL` through ABI wrapper; `VEL` and `FORCE_POS` return unsupported.
+- CyberBeast supports `MIT` / `POS_VEL` / `VEL` / `FORCE_POS` through the ABI wrapper (all four, unlike Hexfellow/MyActuator). Its parameter surface is float32-only because the ABI exposes the SDO f32 read/write path; other endpoint widths need the runtime JSON descriptor.
 - Full Damiao tuning reference stays in:
   - [DAMIAO_API.md](DAMIAO_API.md)
   - [DAMIAO_API.zh-CN.md](DAMIAO_API.zh-CN.md)

@@ -6,6 +6,7 @@
 - Linux SocketCAN 直接使用已初始化的接口名：`can0`、`can1`。CANable 请刷 candleLight/gs_usb 固件，让系统识别为 `can0` 这类 SocketCAN 接口。
 - 标准 CAN 推荐 PCAN 或 CANable candleLight/gs_usb。
 - CAN-FD 链路可通过 CLI（`--transport socketcanfd`）和 Python SDK（`Controller.from_socketcanfd(...)`）使用，Hexfellow 必须走该链路。
+- CyberBeast 没有 CAN-FD 链路：请走经典 CAN 路径（`Controller(channel)` / `--transport socketcan`），不要把它接到 CAN-FD 控制器上。
 - 仅 Damiao 可选两类适配器链路：串口桥 `--transport dm-serial --serial-port /dev/ttyACM0 --serial-baud 921600`，以及 DM_Device SDK `--transport dm-device --dm-device-type usb2canfd|usb2canfd-dual|linkx4c --dm-channel 0|1|2|3`。DM_Device 链路当前只配 Damiao 电机协议使用，适配器需处于 USB 模式。
 - 仅 Damiao 可选 DM_Device SDK 链路：
   `--transport dm-device --dm-device-type usb2canfd|usb2canfd-dual|linkx4c`；
@@ -128,18 +129,20 @@
   - MyActuator: `add_myactuator_motor(...)`
   - RobStride: `add_robstride_motor(...)`
   - HighTorque: `add_hightorque_motor(...)`
+  - CyberBeast: `add_cyberbeast_motor(...)`（仅经典 CAN；通过 `cyberbeast_get_param_f32(...)` / `cyberbeast_write_param_f32(...)` 访问 SDO 端点）
 - 状态查询统一范式：
   - 推荐统一使用 `request_feedback() -> poll_feedback_once() -> get_state()`。
-  - RobStride 私有协议没有单次“请求状态帧”命令；RobStride 的 `request_feedback()` 是非阻塞 no-op。连通性检查请用 `robstride_ping()`，连续状态请用主动上报，需要新鲜位置/速度请读类型化参数。
+  - RobStride 私有协议没有单次“请求状态帧”命令；RobStride 的 `request_feedback()` 是非阻塞 no-op。连通性检查请用 `robstride_ping()`，连续状态请用主动上报，需要 新鲜位置/速度请读类型化参数。
+  - CyberBeast 的 `request_feedback()` 对应 `QUERY_STATUS`；MIT 响应与心跳同样 会经后台轮询线程刷新状态。`get_state()` 把电机电流映射到 `torq`、两个温度映射到 `t_mos`/`t_rotor`。
 
 ## 统一模式映射摘要（顶层协议 -> 厂商原生）
 
-| 顶层统一模式 | Damiao | RobStride | Hexfellow | MyActuator | HighTorque |
-| --- | --- | --- | --- | --- | --- |
-| `Mode.MIT` | 原生 MIT | 原生 MIT | 原生 MIT（模式 5） | 不支持 | 映射到原生 pos+vel+tqe |
-| `Mode.POS_VEL` | 原生 POS_VEL | 映射到原生 Position（`run_mode=1` + `limit_spd(0x7017)` + `loc_ref(0x7016)`） | 原生 POS_VEL（模式 1） | Position 设定流程 | 映射到原生 pos+vel+tqe |
-| `Mode.VEL` | 原生 VEL | 原生 Velocity | 不支持 | 原生 Velocity 设定流程 | 原生速度命令 |
-| `Mode.FORCE_POS` | 原生 FORCE_POS | 不支持 | 不支持 | 不支持 | 映射到原生 pos+vel+tqe |
+| 顶层统一模式 | Damiao | RobStride | Hexfellow | MyActuator | HighTorque | CyberBeast |
+| --- | --- | --- | --- | --- | --- | --- |
+| `Mode.MIT` | 原生 MIT | 原生 MIT | 原生 MIT（模式 5） | 不支持 | 映射到原生 pos+vel+tqe | 原生 MIT |
+| `Mode.POS_VEL` | 原生 POS_VEL | 映射到原生 Position（`run_mode=1` + `limit_spd(0x7017)` + `loc_ref(0x7016)`） | 原生 POS_VEL（模式 1） | Position 设定流程 |  映射到原生 pos+vel+tqe | 原生位置控制（`--vlim` 映射为速度限制） |
+| `Mode.VEL` | 原生 VEL | 原生 Velocity | 不支持 | 原生 Velocity 设定流程 | 原生速度命令 | 原生速度控制 |
+| `Mode.FORCE_POS` | 原生 FORCE_POS | 不支持 | 不支持 | 不支持 | 映射到原生 pos+vel+tqe | 映射到原生力矩控制；只用 `--ratio`（`torque = ratio * 模型 MIT 力矩上限`） |
 
 说明：
 
@@ -147,6 +150,9 @@
 - `TORQUE/CURRENT` 对 RobStride 仍为参数级能力（`robstride_write_param_*`），尚未提供独立统一模式。
 - RobStride 建议默认使用 `feedback-id=0xFD`；扫描默认尝试 `0xFD,0xFF,0xFE,0x00,0xAA`。
 - RobStride 的 `feedback_id` / `host_id` 不是电机 `device_id`；扫描命中的电机 ID 看 `probe` / `device_id`。
+- CyberBeast 没有 CAN-FD 路径：请用 `Controller(channel)`，`--transport` 保持 `socketcan`（该厂商会拒绝 `--transport socketcanfd`）。
+- CyberBeast 的 `feedback_id` 仅为签名兼容保留、协议不使用；反馈帧按 `motor_id` 寻址。
+- CyberBeast 的 `ensure_mode(mode, timeout_ms)` 会校验统一模式码并启动轴（`START_MOTOR`）；真正的模式由每帧控制指令携带（MIT / 位置 / 速度 / 力矩报文类型），不会写模式寄存器。
 
 ## 快速开始
 
@@ -258,6 +264,23 @@ with Controller.from_socketcanfd("can0") as ctrl:
     ctrl.enable_all()
     motor.ensure_mode(Mode.MIT, 1000)      # Hexfellow 仅支持 MIT / POS_VEL
     motor.send_mit(0.8, 1.0, 30.0, 1.0, 0.1)
+    print(motor.get_state())
+    motor.close()
+```
+
+CyberBeast 快速示例（经典 CAN + ODrive SDO 端点）:
+
+```python
+from motorbridge import Controller, EP_CONTROLLER_ERROR, Mode
+
+with Controller("can0") as ctrl:
+    motor = ctrl.add_cyberbeast_motor(0x01, 0x01, "odrive-default")
+    print(motor.cyberbeast_get_param_f32(EP_CONTROLLER_ERROR, 500))
+    ctrl.enable_all()                          # enable = 进入 AXIS_STATE_CLOSED_LOOP
+    motor.ensure_mode(Mode.POS_VEL, 1000)      # 校验模式码并启动轴
+    motor.send_pos_vel(0.5, 2.0)
+    motor.cyberbeast_write_param_f32(0x0039, 5.0)   # controller.config.vel_limit
+    motor.store_parameters()                   # CONFIG_SAVE
     print(motor.get_state())
     motor.close()
 ```
@@ -407,6 +430,7 @@ python -m pip install bindings/python/dist/motorbridge-*.whl
 
 - Damiao wrapper 示例: `examples/python_wrapper_demo.py`
 - Hexfellow CAN-FD 示例: `examples/hexfellow_canfd_demo.py`（仅 MIT / POS_VEL）
+- CyberBeast 经典 CAN 示例: `examples/cyberbeast_demo.py`（SDO 端点读写；MIT / POS_VEL / VEL / FORCE_POS）
 - Damiao 维护接口示例: `examples/damiao_maintenance_demo.py`
 - Damiao 寄存器读写示例: `examples/damiao_register_rw_demo.py`
 - Damiao 串口桥链路示例: `examples/damiao_dm_serial_demo.py`
@@ -453,6 +477,12 @@ Python 示例中 Damiao 用法已覆盖到位：
 | HighTorque | `mit` | `--pos --vel --tau` | `--kp/--kd` 为统一签名兼容参数，`ht_can v1.5.5` 会忽略 |
 | Hexfellow | `mit` | `--pos --vel --kp --kd --tau` | CAN-FD 路径 |
 | Hexfellow | `pos-vel` | `--pos --vlim` | CAN-FD 路径 |
+| CyberBeast | `mit` | `--pos --vel --kp --kd --tau` | 经典 CAN 路径 |
+| CyberBeast | `pos-vel` | `--pos --vlim` | 经典 CAN 路径；`--vlim` 变成速度限制 |
+| CyberBeast | `vel` | `--vel` | 经典 CAN 路径 |
+| CyberBeast | `force-pos` | `--ratio` | 纯力矩：`torque = ratio * 18 Nm`；`--pos/--vlim` 会被忽略（会打印 warning） |
+| CyberBeast | `read-param` / `write-param` | `--param-id --param-value --store` | 16 位 SDO 端点，仅 f32；`write-param` 会回读并打印 `requested`/`value`/`verified` |
+| CyberBeast | `enable` / `disable` / `clear-error` / `save` / `set-zero` | - | `enable` 启动闭环，`save` 发送 `CONFIG_SAVE` |
 
 RobStride `pos-vel` 的 `--vel`、`--kd`、`--tau` 是无效参数：该路径实际写入
 `limit_spd`、`loc_kp`、`loc_ref`。Rust CLI 和 Python CLI 在用户显式传入这些参数时会输出 warning。
@@ -500,13 +530,16 @@ python3 bindings/python/examples/robstride_wrapper_demo.py \
 
 ## 说明
 
-- `id-dump` 仍是 Damiao 工作流；`id-set` 支持 Damiao 和 RobStride；`scan` 支持 `damiao|hexfellow|myactuator|robstride|hightorque|all`。
+- `id-dump` 仍是 Damiao 工作流；`id-set` 支持 Damiao 和 RobStride；`scan` 支持 `damiao|hexfellow|myactuator|robstride|hightorque|cyberbeast|all`。
 - RobStride `id-set` 中，`--new-motor-id` 修改 `device_id`；`--feedback-id` 仍是上位机侧 host_id。
 - RobStride `motor_id` / `device_id` 会校验为 `1..255`；`feedback_id` / `host_id` 会校验为 `0..255`，避免 `ctypes` 静默截断。
 - Python CLI 与 Rust CLI 在生产常用的 Damiao / RobStride 工作流上已经对齐：扫描、使能/失能、控制、改 ID、参数读写、RobStride 清故障和主动上报。Rust CLI 仍保留更多 HighTorque/MyActuator/Hexfellow 的底层调试入口。
 - RobStride 扫描会通过指定 host_id 的 ABI helper 精确探测每个 `--feedback-ids`；非法 host_id 会直接报错，不会静默回退。
+- CyberBeast 的 CAN 节点 ID（`motor_id` / `feedback_id`）会校验为 `0..255`：协议按 8 位字段携带，超范围会在库内部被截断。
+- CyberBeast 扫描逐个节点 ID 探测，以状态响应作为命中依据；探测流程是“使能 -> 查询状态 -> 再次失能”。
 - MyActuator 在 ABI wrapper 中不支持 `Mode.MIT` 与 `send_force_pos`。
 - Hexfellow 在 ABI wrapper 中支持 `MIT` 与 `POS_VEL`，`VEL` / `FORCE_POS` 会返回不支持。
+- CyberBeast 在 ABI wrapper 中四个模式都支持（`MIT` / `POS_VEL` / `VEL` / `FORCE_POS`，与 Hexfellow/MyActuator 不同）。参数接口只开放 float32：ABI 仅暴露 SDO f32 读写路径，其他宽度的端点需要运行期 JSON 描述符。
 - Damiao 的完整调参参考仍保留在:
   - [DAMIAO_API.md](DAMIAO_API.md)
   - [DAMIAO_API.zh-CN.md](DAMIAO_API.zh-CN.md)

@@ -25,7 +25,7 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--vendor",
         default="damiao",
-        choices=["damiao", "myactuator", "robstride", "hightorque", "hexfellow"],
+        choices=["damiao", "myactuator", "robstride", "hightorque", "hexfellow", "cyberbeast"],
         help="motor vendor/protocol family, default damiao",
     )
     p.add_argument("--channel", default="can0", help="SocketCAN/CAN-FD channel, default can0")
@@ -143,6 +143,11 @@ def _vendor_defaults(vendor: str, model: str, feedback_id: str) -> tuple[str, st
             resolved_model = "hexfellow"
         if resolved_feedback == "0x11":
             resolved_feedback = "0x00"
+    elif vendor == "cyberbeast":
+        if resolved_model == "4340":
+            resolved_model = "odrive-default"
+        if resolved_feedback == "0x11":
+            resolved_feedback = "0x01"
     return resolved_model, resolved_feedback
 
 def _add_motor(ctrl: Controller, vendor: str, motor_id: int, feedback_id: int, model: str):
@@ -154,6 +159,8 @@ def _add_motor(ctrl: Controller, vendor: str, motor_id: int, feedback_id: int, m
         return ctrl.add_hightorque_motor(motor_id, feedback_id, model)
     if vendor == "hexfellow":
         return ctrl.add_hexfellow_motor(motor_id, feedback_id, model)
+    if vendor == "cyberbeast":
+        return ctrl.add_cyberbeast_motor(motor_id, feedback_id, model)
     return ctrl.add_damiao_motor(motor_id, feedback_id, model)
 
 def _open_controller(args: argparse.Namespace, vendor: str) -> Controller:
@@ -170,6 +177,10 @@ def _open_controller(args: argparse.Namespace, vendor: str) -> Controller:
         if transport == "socketcan":
             raise ValueError("vendor=hexfellow requires --transport socketcanfd (or auto)")
         return Controller.from_socketcanfd(args.channel)
+    if vendor == "cyberbeast" and transport == "socketcanfd":
+        raise ValueError(
+            "vendor=cyberbeast has no CAN-FD path; use --transport socketcan (or auto)"
+        )
     if transport == "socketcanfd":
         return Controller.from_socketcanfd(args.channel)
     return Controller(args.channel)

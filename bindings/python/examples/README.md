@@ -146,6 +146,7 @@ python3 bindings/python/examples/quad_vendor_binding_ws_demo.py \
 - `quad_vendor_binding_ws_demo.py`: Python binding WS bridge backend (for web UI control)
 - `quad_vendor_binding_ws_demo.html`: simple web UI for `quad_vendor_binding_ws_demo.py`
 - `hexfellow_canfd_demo.py`: Hexfellow CAN-FD demo (`mit` / `pos-vel` only)
+- `cyberbeast_demo.py`: CyberBeast classic-CAN demo (SDO endpoint read/write + `probe` / `mit` / `pos-vel` / `vel` / `force-pos`)
 - `full_modes_demo.py`: Damiao full-mode demo
 - `pid_register_tune_demo.py`: Damiao register tuning
 - `scan_ids_demo.py`: Damiao fast scan (legacy helper)
@@ -346,6 +347,18 @@ Hexfellow (CAN-FD only):
 ```bash
 PYTHONPATH=bindings/python/src python3 bindings/python/examples/hexfellow_canfd_demo.py \
   --channel can0 --motor-id 0x01 --feedback-id 0x00 --mode mit --loop 20 --dt-ms 50
+```
+
+CyberBeast (classic CAN, ODrive SDO endpoints):
+
+```bash
+# endpoint probe only (no control loop)
+PYTHONPATH=bindings/python/src python3 bindings/python/examples/cyberbeast_demo.py \
+  --channel can0 --motor-id 0x01 --mode probe
+
+# position control over SDO endpoints + CAN
+PYTHONPATH=bindings/python/src python3 bindings/python/examples/cyberbeast_demo.py \
+  --channel can0 --motor-id 0x01 --mode pos-vel --pos 0.5 --vlim 2.0 --loop 20 --dt-ms 20
 ```
 
 Unified vendor scan via CLI:

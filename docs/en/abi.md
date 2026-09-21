@@ -64,15 +64,16 @@ Common control/state APIs:
 - RobStride: `motor_controller_add_robstride_motor(...)`
 - MyActuator: `motor_controller_add_myactuator_motor(...)`
 - HighTorque: `motor_controller_add_hightorque_motor(...)`
+- CyberBeast: `motor_controller_add_cyberbeast_motor(...)` (classic CAN path only)
 
 ## Unified Mode to Native Protocol Mapping
 
-| Unified mode | Damiao native | Hexfellow native | RobStride native | MyActuator native | HighTorque native |
-|---|---|---|---|---|---|
-| `MIT` | `Mit` | mode `5` | `Mit` | not available | mapped to native pos+vel+tqe |
-| `POS_VEL` | `PosVel` | mode `1` | mapped to `Position` (`run_mode=1`, `limit_spd=0x7017`, `loc_ref=0x7016`) | `Position` setpoint flow | mapped to native pos+vel+tqe |
-| `VEL` | `Vel` | not available | `Velocity` | `Velocity` setpoint flow | mapped to native velocity command |
-| `FORCE_POS` | `ForcePos` | not available | not available | not available | mapped to native pos+vel+tqe |
+| Unified mode | Damiao native | Hexfellow native | RobStride native | MyActuator native | HighTorque native | CyberBeast native |
+|---|---|---|---|---|---|---|
+| `MIT` | `Mit` | mode `5` | `Mit` | not available | mapped to native pos+vel+tqe | `Mit` |
+| `POS_VEL` | `PosVel` | mode `1` | mapped to `Position` (`run_mode=1`, `limit_spd=0x7017`, `loc_ref=0x7016`) | `Position` setpoint flow | mapped to native pos+vel+tqe | `Position` (velocity limit becomes the speed limit) |
+| `VEL` | `Vel` | not available | `Velocity` | `Velocity` setpoint flow | mapped to native velocity command | `Velocity` |
+| `FORCE_POS` | `ForcePos` | not available | not available | not available | mapped to native pos+vel+tqe | mapped to native torque control; only the ratio is used (`torque = ratio * model MIT torque limit`) |
 
 Behavior rule:
 
@@ -80,6 +81,9 @@ Behavior rule:
 - Signatures stay stable even when a vendor ignores part of a signature.
 - Example: HighTorque accepts `send_mit(pos, vel, kp, kd, tau)` for interface consistency, but native protocol does not use `kp/kd`.
 - Hexfellow ABI path supports MIT and POS_VEL, and reports `VEL` / `FORCE_POS` as unsupported.
+- CyberBeast ABI path supports MIT / POS_VEL / VEL / FORCE_POS. `feedback_id` is accepted for signature parity but ignored: command and feedback frames are addressed by `motor_id` (8-bit CAN node ID).
+- CyberBeast `motor_handle_ensure_mode` validates the unified mode code and sends `START_MOTOR`; the active mode is carried by each control frame (MIT / position / velocity / torque message type), not by a mode register write.
+- CyberBeast parameter access is float32-only over 16-bit ODrive SDO endpoints (`motor_handle_cyberbeast_get_param_f32` / `_write_param_f32`); the endpoint map itself is discovered at runtime via `MSG_JSON_DESC_READ`.
 - RobStride supports MIT / POS_VEL / VEL on unified APIs; torque/current remains parameter-level (`robstride_write_param_*`), not a unified mode.
 - Damiao set-zero sequence rule: call `motor_handle_disable` before `motor_handle_set_zero_position`; otherwise set-zero is rejected by core guard.
 - Damiao set-zero settle rule: core applies an internal fixed settle (`~20ms`) after successful `set_zero_position` (no extra ABI parameter).
@@ -103,6 +107,11 @@ RobStride extensions:
 - `motor_handle_robstride_get_param_f32_host_id`
 - `motor_handle_robstride_write_param_i8/u8/u16/u32/f32`
 - `motor_handle_robstride_get_param_i8/u8/u16/u32/f32`
+
+CyberBeast extensions (ODrive SDO endpoints):
+
+- `motor_handle_cyberbeast_get_param_f32(motor, param_id, timeout_ms, out_value)`
+- `motor_handle_cyberbeast_write_param_f32(motor, param_id, value)` (waits for the device write acknowledgment, 200 ms budget)
 
 ## Typical Call Flow
 

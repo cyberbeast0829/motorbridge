@@ -7,6 +7,21 @@ Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- CyberBeast support in the Python binding:
+  - `Controller.add_cyberbeast_motor(motor_id, feedback_id, model)` on the classic
+    CAN path (this vendor has no CAN-FD transport), plus
+    `Motor.cyberbeast_get_param_f32(param_id, timeout_ms)` and
+    `Motor.cyberbeast_write_param_f32(param_id, value)` for 16-bit ODrive SDO
+    endpoints. A write returns only after the device acknowledges it and the CLI
+    reads the value back, reporting `requested` / `value` / `verified`.
+  - `motorbridge.cyberbeast_endpoints` documents the common endpoint IDs and
+    mirrors `motor_vendors/cyberbeast/src/registers.rs`.
+  - Python CLI support: `--vendor cyberbeast` for `run` (all four unified modes,
+    `read-param` / `write-param`, `save`, `set-zero`) and `scan`.
+  - `bindings/python/examples/cyberbeast_demo.py`.
+
 ## [0.4.9] - 2026-07-06
 
 ### Fixed

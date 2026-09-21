@@ -40,8 +40,45 @@ def _run_command(args: argparse.Namespace) -> None:
         motor = _add_motor(ctrl, args.vendor, motor_id, feedback_id, args.model)
         try:
             if args.mode in ("read-param", "write-param"):
+                if args.vendor == "cyberbeast":
+                    param_id = _parse_id(args.param_id)
+                    if args.param_type and args.param_type != "f32":
+                        raise ValueError(
+                            "cyberbeast SDO endpoints are accessed as f32 by the ABI; "
+                            "--param-type must be f32"
+                        )
+                    if args.mode == "read-param":
+                        value = motor.cyberbeast_get_param_f32(param_id, args.timeout_ms)
+                        print(
+                            f"command=run mode=read-param vendor=cyberbeast "
+                            f"param_id=0x{param_id:04X} type=f32 value={value}"
+                        )
+                    else:
+                        if args.param_value == "":
+                            raise ValueError("run --mode write-param requires --param-value")
+                        requested = float(args.param_value)
+                        motor.cyberbeast_write_param_f32(param_id, requested)
+                        time.sleep(0.05)
+                        value = motor.cyberbeast_get_param_f32(param_id, args.timeout_ms)
+                        verified = abs(value - requested) <= max(1e-6, abs(requested) * 1e-6)
+                        if args.store:
+                            motor.store_parameters()
+                        print(
+                            f"command=run mode=write-param vendor=cyberbeast "
+                            f"param_id=0x{param_id:04X} type=f32 requested={requested} "
+                            f"value={value} verified={int(verified)} store={int(bool(args.store))}"
+                        )
+                        if not verified:
+                            print(
+                                "[warn] read back differs from the requested value; the device "
+                                "clamped it or consumed it immediately (see axis.requested_state)"
+                            )
+                    return
                 if args.vendor != "robstride":
-                    raise ValueError("run --mode read-param/write-param is currently supported for --vendor robstride only")
+                    raise ValueError(
+                        "run --mode read-param/write-param supports --vendor robstride and "
+                        "--vendor cyberbeast only"
+                    )
                 param_id = _parse_id(args.param_id)
                 param_type = _infer_robstride_param_type(param_id, args.param_type)
                 if args.mode == "read-param":
@@ -65,8 +102,8 @@ def _run_command(args: argparse.Namespace) -> None:
                     )
                 return
             if args.mode == "save":
-                if args.vendor != "robstride":
-                    raise ValueError("run --mode save is currently supported for --vendor robstride only")
+                if args.vendor not in ("robstride", "cyberbeast"):
+                    raise ValueError("run --mode save supports --vendor robstride and --vendor cyberbeast only")
                 motor.store_parameters()
                 print("[ok] save-parameters requested")
                 return
@@ -131,7 +168,7 @@ def _run_command(args: argparse.Namespace) -> None:
             for i in range(args.loop):
                 if args.mode == "enable":
                     motor.enable()
-                    if args.vendor == "damiao":
+                    if args.vendor in ("damiao", "cyberbeast"):
                         motor.request_feedback()
                 elif args.mode == "disable":
                     motor.disable()
@@ -184,8 +221,22 @@ def _run_command(args: argparse.Namespace) -> None:
                 elif args.mode == "force-pos":
                     if args.vendor in ("robstride", "myactuator", "hexfellow"):
                         raise ValueError(f"{args.vendor} does not support force-pos command")
+                    if args.vendor == "cyberbeast":
+                        print(
+                            "[warn] cyberbeast force-pos sends a pure torque command: "
+                            "--ratio scales the model MIT torque limit and --pos/--vlim are ignored"
+                        )
                     motor.send_force_pos(args.pos, args.vlim, args.ratio)
                 elif args.mode in ("zero", "set-zero"):
+                    if args.vendor == "cyberbeast":
+                        motor.set_zero_position()
+                        if args.store:
+                            motor.store_parameters()
+                        print(
+                            f"[ok] cyberbeast set-zero requested "
+                            f"(store={int(bool(args.store))})"
+                        )
+                        break
                     if args.vendor != "robstride":
                         raise ValueError("zero/set-zero mode is currently supported for --vendor robstride only")
                     if not args.zero_exp:
@@ -219,6 +270,14 @@ def _run_command(args: argparse.Namespace) -> None:
                     st = motor.get_state()
                     if st is None:
                         print(f"#{i} no feedback yet")
+                    elif args.vendor == "cyberbeast":
+                        # The unified state maps CyberBeast current to torq and the
+                        # two device temperatures to t_mos/t_rotor.
+                        print(
+                            f"#{i} pos={st.pos:+.4f} vel={st.vel:+.4f} "
+                            f"current={st.torq:+.3f}A err=0x{st.status_code:X} "
+                            f"mos_temp={st.t_mos:.1f}C motor_temp={st.t_rotor:.1f}C"
+                        )
                     else:
                         print(
                             f"#{i} pos={st.pos:+.3f} vel={st.vel:+.3f} "

@@ -133,6 +133,31 @@ class Controller:
             raise CallError(f"add_hightorque_motor failed: {_err_text()}")
         return Motor(m)
 
+    def add_cyberbeast_motor(self, motor_id: int, feedback_id: int, model: str) -> "Motor":
+        """Register a CyberBeast (ODrive SDO / CAN node) motor.
+
+        CyberBeast has no CAN-FD transport: open the link with
+        ``Controller(channel)`` / ``--transport socketcan``.
+
+        ``motor_id`` is the 8-bit CAN node ID used as command destination and
+        feedback source. ``feedback_id`` exists for signature parity with the
+        other vendors but is ignored by the protocol.
+
+        ``model`` selects the P/V/T limits from the built-in catalog:
+        ``odrive-default``, ``odrive-pro``, ``odrive-high-torque``,
+        ``odrive-high-speed``.
+        """
+        if not 0 <= int(motor_id) <= 255:
+            raise ValueError(f"CyberBeast motor_id must be in 0..255, got {motor_id}")
+        if not 0 <= int(feedback_id) <= 255:
+            raise ValueError(f"CyberBeast feedback_id must be in 0..255, got {feedback_id}")
+        m = self._abi.lib.motor_controller_add_cyberbeast_motor(
+            self._require_open(), motor_id, feedback_id, model.encode()
+        )
+        if not m:
+            raise CallError(f"add_cyberbeast_motor failed: {_err_text()}")
+        return Motor(m)
+
     def __enter__(self) -> "Controller":
         return self
 
@@ -385,6 +410,35 @@ class Motor:
 
     def damiao_write_param_u32(self, param_id: int, value: int) -> None:
         _ok(self._abi.lib.motor_handle_damiao_write_param_u32(self._require_open(), param_id, value), "damiao_write_param_u32")
+
+    def cyberbeast_get_param_f32(self, param_id: int, timeout_ms: int = 1000) -> float:
+        """Read an ODrive SDO endpoint (16-bit ``param_id``) as float32.
+
+        ``motorbridge.cyberbeast_endpoints`` lists the commonly used endpoint
+        IDs. The ABI enforces a 200 ms floor on ``timeout_ms``.
+        """
+        out = c_float(0.0)
+        _ok(
+            self._abi.lib.motor_handle_cyberbeast_get_param_f32(
+                self._require_open(), param_id, timeout_ms, ctypes.byref(out)
+            ),
+            "cyberbeast_get_param_f32",
+        )
+        return float(out.value)
+
+    def cyberbeast_write_param_f32(self, param_id: int, value: float) -> None:
+        """Write an ODrive SDO endpoint (16-bit ``param_id``) as float32.
+
+        Blocks until the device acknowledges the write (200 ms budget), so a
+        returned call means the value was accepted, not merely queued. Call
+        :meth:`store_parameters` to persist it to flash (``CONFIG_SAVE``).
+        """
+        _ok(
+            self._abi.lib.motor_handle_cyberbeast_write_param_f32(
+                self._require_open(), param_id, float(value)
+            ),
+            "cyberbeast_write_param_f32",
+        )
 
     def get_state(self) -> MotorState | None:
         st = CState()

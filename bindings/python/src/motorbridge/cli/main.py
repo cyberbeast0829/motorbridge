@@ -39,6 +39,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "  hightorque mit:   --pos --vel --tau; --kp/--kd ignored by ht_can v1.5.5\n"
             "  hexfellow mit:    --pos --vel --kp --kd --tau\n"
             "  hexfellow pos-vel: --pos --vlim\n"
+            "  cyberbeast mit:   --pos --vel --kp --kd --tau\n"
+            "  cyberbeast pos-vel: --pos --vlim\n"
+            "  cyberbeast vel:   --vel\n"
+            "  cyberbeast force-pos: --ratio (torque = ratio * model MIT torque limit; --pos/--vlim ignored)\n"
             "\n"
             "Examples:\n"
             "  motorbridge-cli scan --vendor robstride --channel can0 --start-id 1 --end-id 127\n"
@@ -86,7 +90,7 @@ def _build_parser() -> argparse.ArgumentParser:
     scan.add_argument(
         "--vendor",
         default="damiao",
-        choices=["damiao", "myactuator", "robstride", "hightorque", "hexfellow", "all"],
+        choices=["damiao", "myactuator", "robstride", "hightorque", "hexfellow", "cyberbeast", "all"],
         help="vendor/protocol to scan, or all for combined scan",
     )
     scan.add_argument("--channel", default="can0", help="SocketCAN/CAN-FD channel")

@@ -138,6 +138,8 @@ class Abi:
         lib.motor_controller_add_robstride_motor.restype = c_void_p
         lib.motor_controller_add_hightorque_motor.argtypes = [c_void_p, c_uint16, c_uint16, c_char_p]
         lib.motor_controller_add_hightorque_motor.restype = c_void_p
+        lib.motor_controller_add_cyberbeast_motor.argtypes = [c_void_p, c_uint16, c_uint16, c_char_p]
+        lib.motor_controller_add_cyberbeast_motor.restype = c_void_p
 
         lib.motor_handle_free.argtypes = [c_void_p]
         lib.motor_handle_enable.argtypes = [c_void_p]
@@ -228,6 +230,11 @@ class Abi:
         lib.motor_handle_damiao_write_param_f32.restype = c_int32
         lib.motor_handle_damiao_write_param_u32.argtypes = [c_void_p, c_uint16, c_uint32]
         lib.motor_handle_damiao_write_param_u32.restype = c_int32
+
+        lib.motor_handle_cyberbeast_get_param_f32.argtypes = [c_void_p, c_uint16, c_uint32, POINTER(c_float)]
+        lib.motor_handle_cyberbeast_get_param_f32.restype = c_int32
+        lib.motor_handle_cyberbeast_write_param_f32.argtypes = [c_void_p, c_uint16, c_float]
+        lib.motor_handle_cyberbeast_write_param_f32.restype = c_int32
 
 
 _abi_singleton: Abi | None = None

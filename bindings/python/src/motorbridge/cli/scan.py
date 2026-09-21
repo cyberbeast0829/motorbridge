@@ -243,6 +243,49 @@ def _scan_hightorque(args: argparse.Namespace, start_id: int, end_id: int) -> li
         ctrl.close()
     return found
 
+def _scan_cyberbeast(args: argparse.Namespace, start_id: int, end_id: int) -> list[tuple[int, str]]:
+    found: list[tuple[int, str]] = []
+    lo = max(0, start_id)
+    hi = min(255, end_id)
+    print(
+        f"[scan:cyberbeast] channel={args.channel} model={args.model} "
+        f"id_range=[0x{lo:X},0x{hi:X}] timeout_ms={args.timeout_ms}"
+    )
+    ctrl = _open_controller(args, "cyberbeast")
+    try:
+        for mid in range(lo, hi + 1):
+            # CyberBeast addresses feedback by motor ID; feedback_id is not used.
+            motor = ctrl.add_cyberbeast_motor(mid, mid, args.model)
+            try:
+                try:
+                    motor.enable()
+                    motor.request_feedback()
+                    time.sleep(min(max(args.timeout_ms, 10), 300) / 1000.0)
+                    ctrl.poll_feedback_once()
+                    st = motor.get_state()
+                    if st is None:
+                        raise RuntimeError("no feedback")
+                    meta = (
+                        f"vendor=cyberbeast node_id=0x{mid:02X} "
+                        f"pos={st.pos:+.4f}rad vel={st.vel:+.4f}rad/s "
+                        f"current={st.torq:+.3f}A err=0x{st.status_code:X} "
+                        f"mos_temp={st.t_mos:.1f}C motor_temp={st.t_rotor:.1f}C"
+                    )
+                    found.append((mid, meta))
+                    print(f"[hit] probe=0x{mid:02X} {meta}")
+                except Exception:
+                    print(f"[.. ] vendor=cyberbeast probe=0x{mid:02X} no reply")
+            finally:
+                try:
+                    motor.disable()
+                except Exception:
+                    pass
+                motor.close()
+    finally:
+        ctrl.close_bus()
+        ctrl.close()
+    return found
+
 def _scan_command(args: argparse.Namespace) -> None:
     start_id = _parse_id(args.start_id)
     end_id = _parse_id(args.end_id)
@@ -262,6 +305,7 @@ def _scan_command(args: argparse.Namespace) -> None:
     myactuator_model = "X8" if args.model == "4340" else args.model
     robstride_model = "rs-00" if args.model == "4340" else args.model
     hightorque_model = "hightorque" if args.model == "4340" else args.model
+    cyberbeast_model = "odrive-default" if args.model == "4340" else args.model
     if args.vendor in ("damiao", "all"):
         args.model = damiao_model
         found.extend(_scan_damiao(args, start_id, end_id))
@@ -274,6 +318,9 @@ def _scan_command(args: argparse.Namespace) -> None:
     if args.vendor in ("hightorque", "all"):
         args.model = hightorque_model
         found.extend(_scan_hightorque(args, start_id, end_id))
+    if args.vendor in ("cyberbeast", "all"):
+        args.model = cyberbeast_model
+        found.extend(_scan_cyberbeast(args, start_id, end_id))
 
     print(f"scan done: {len(found)} motor(s) found")
     for probe, meta in found:

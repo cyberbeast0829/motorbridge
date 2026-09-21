@@ -144,6 +144,7 @@ python3 bindings/python/examples/quad_vendor_binding_ws_demo.py \
 - `quad_vendor_binding_ws_demo.py`：Python binding WS 桥后端（用于网页控制）
 - `quad_vendor_binding_ws_demo.html`：`quad_vendor_binding_ws_demo.py` 的网页 UI
 - `hexfellow_canfd_demo.py`：Hexfellow CAN-FD 示例（仅 `mit` / `pos-vel`）
+- `cyberbeast_demo.py`：CyberBeast 经典 CAN 示例（SDO 端点读写 + `probe` / `mit` / `pos-vel` / `vel` / `force-pos`）
 - `full_modes_demo.py`：Damiao 全模式示例
 - `pid_register_tune_demo.py`：Damiao 参数调优示例
 - `scan_ids_demo.py`：Damiao 快速扫描（历史辅助脚本）
@@ -344,6 +345,18 @@ Hexfellow（仅 CAN-FD）：
 ```bash
 PYTHONPATH=bindings/python/src python3 bindings/python/examples/hexfellow_canfd_demo.py \
   --channel can0 --motor-id 0x01 --feedback-id 0x00 --mode mit --loop 20 --dt-ms 50
+```
+
+CyberBeast（经典 CAN，ODrive SDO 端点）：
+
+```bash
+# 仅侦测端点（不跑控制环）
+PYTHONPATH=bindings/python/src python3 bindings/python/examples/cyberbeast_demo.py \
+  --channel can0 --motor-id 0x01 --mode probe
+
+# 端点 + CAN 位置控制
+PYTHONPATH=bindings/python/src python3 bindings/python/examples/cyberbeast_demo.py \
+  --channel can0 --motor-id 0x01 --mode pos-vel --pos 0.5 --vlim 2.0 --loop 20 --dt-ms 20
 ```
 
 CLI 统一扫描所有厂商：
