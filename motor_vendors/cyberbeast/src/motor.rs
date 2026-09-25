@@ -1,6 +1,6 @@
 use crate::protocol::{
     self, can_id_parts, encode_clear_errors, encode_config_save, encode_current_control,
-    encode_param_read, encode_param_write, encode_pos_control, encode_set_zero,
+    encode_param_read_at, encode_param_write, encode_pos_control, encode_set_zero,
     encode_torque_control, encode_vel_control, make_can_id, pack_mit_command, seq_next,
     unpack_mit_response, CyberBeastCanId, MitCommandParams, MsgType, Priority, ADDR_BROADCAST,
     DEFAULT_MASTER_ID, MAX_BROADCAST_DEVICES,
@@ -92,6 +92,13 @@ struct ParamCache {
     reply_time: HashMap<u16, Instant>,
     /// Write acknowledgment: endpoint_id → time of last ack.
     write_ack_time: HashMap<u16, Instant>,
+    /// Last response shape per endpoint: (data_len, more, when).
+    ///
+    /// Used to report "this endpoint is not a 4-byte float32" instead of a bare
+    /// timeout, and to follow the More flag of segmented values.
+    shapes: HashMap<u16, (u8, bool, Instant)>,
+    /// Assembled little-endian value bytes of the last (possibly segmented) read.
+    raw: HashMap<u16, Vec<u8>>,
     /// Pending read endpoint (if any).
     pending_read: Option<u16>,
     /// Pending write endpoint (if any).
@@ -104,15 +111,29 @@ impl ParamCache {
             values: HashMap::new(),
             reply_time: HashMap::new(),
             write_ack_time: HashMap::new(),
+            shapes: HashMap::new(),
+            raw: HashMap::new(),
             pending_read: None,
             pending_write: None,
         }
     }
 
-    fn record_read_response(&mut self, endpoint_id: u16, value: f32) {
-        self.values.insert(endpoint_id, value);
-        self.reply_time.insert(endpoint_id, Instant::now());
-        self.pending_read = None;
+    /// Record a PARAM_READ response, assembling segmented values chunk by chunk.
+    fn record_read_frame(&mut self, response: &protocol::ParamReadResponse) {
+        let now = Instant::now();
+        self.shapes.insert(
+            response.endpoint_id,
+            (response.data_len, response.more, now),
+        );
+        let entry = self.raw.entry(response.endpoint_id).or_default();
+        entry.extend_from_slice(&response.raw[..response.data_len as usize]);
+        if !response.more {
+            self.reply_time.insert(response.endpoint_id, now);
+            if let Some(value) = response.as_f32() {
+                self.values.insert(response.endpoint_id, value);
+            }
+            self.pending_read = None;
+        }
     }
 
     fn record_write_ack(&mut self, endpoint_id: u16) {
@@ -131,6 +152,18 @@ const DEFAULT_MIT_KP_LIMIT: f32 = 500.0; // max Kp (N·m/rad)
 const DEFAULT_MIT_KD_LIMIT: f32 = 100.0; // max Kd (N·m·s/rad)
 const DEFAULT_MIT_TORQUE_LIMIT: f32 = 18.0; // ±18 N·m
 const DEFAULT_MIT_CURRENT_LIMIT: f32 = 40.0; // ± A (for response decoding)
+
+/// Motor-side turns → radians.
+///
+/// Feedback frames (HEARTBEAT 4.6, QUERY_POS_VEL 4.10.2) report **motor-side**
+/// turns / turns per second, while `CyberBeastMotorState` stores radians. Both
+/// feedback paths must use this constant so the cached state never changes unit
+/// depending on which frame arrived last.
+///
+/// Note: MIT/POS/VEL/TORQUE commands carry **output-side** units (the firmware
+/// applies `× gear_ratio / 2π`), so this motor-side value is only directly
+/// comparable with a command target when the gear ratio is 1.
+const MOTOR_TURNS_TO_RAD: f32 = 2.0 * std::f32::consts::PI;
 
 // ============================================================================
 // 命令侧电流限兜底值
@@ -193,8 +226,14 @@ pub struct CyberBeastMotorState {
     /// Parsed CAN ID fields.
     pub can_id_parts: CyberBeastCanId,
     /// Position in radians (output side).
+    /// Position in motor-side radians (motor turns × 2π).
+    ///
+    /// Feedback is reported by the device in motor-side turns (HEARTBEAT,
+    /// QUERY_POS_VEL); this struct converts it to radians. Control commands use
+    /// output-side units, so compare against a command target only when the gear
+    /// ratio is 1 (the model catalog carries no gear ratio).
     pub pos: f32,
-    /// Velocity in rad/s (output side).
+    /// Velocity in motor-side rad/s (motor turns/s × 2π). See `pos`.
     pub vel: f32,
     /// Motor current in Amps.
     pub current: f32,
@@ -342,8 +381,7 @@ impl CyberBeastMotor {
         )
     }
 
-    /// Build a broadcast CAN ID (reserved for future CAN FD broadcast support).
-    #[allow(dead_code)]
+    /// Build a broadcast CAN ID: `Dest=0xFF` means a global broadcast.
     fn bcast_can_id(&self, priority: Priority, msg_type: MsgType) -> u32 {
         // For broadcast, dest encodes a bitmask of target devices.
         // For full broadcast, use 0xFF.
@@ -483,8 +521,12 @@ impl CyberBeastMotor {
     }
 
     /// Send emergency stop.
+    ///
+    /// Protocol 4.9: ESTOP is a **global broadcast** — `Priority=0 (CRITICAL)`,
+    /// `MsgType=0xC0`, `Dest=0xFF`. Every device on the bus enters IDLE and latches
+    /// `ERROR_ESTOP_REQUESTED`, which needs CLEAR_ERRORS (0x65) or a reset to clear.
     pub fn send_estop(&self) -> Result<()> {
-        let can_id = self.cmd_can_id(Priority::Emergency, MsgType::Estop);
+        let can_id = self.bcast_can_id(Priority::Critical, MsgType::Estop);
         self.send_ext(can_id, [0u8; 8])
     }
 
@@ -548,16 +590,27 @@ impl CyberBeastMotor {
     // Parameter (SDO endpoint) access
     // ========================================================================
 
-    /// Send a parameter read request for an ODrive SDO endpoint.
+    /// Send a parameter read request for an ODrive SDO endpoint (value offset 0).
     pub fn send_param_read(&self, endpoint_id: u16) -> Result<()> {
+        self.send_param_read_at(endpoint_id, 0)
+    }
+
+    /// Send a PARAM_READ request for a specific byte offset inside the value.
+    ///
+    /// Offset 0 starts a new read sequence and drops any previously assembled
+    /// bytes; later offsets continue a segmented read.
+    pub fn send_param_read_at(&self, endpoint_id: u16, offset: u32) -> Result<()> {
         {
             let mut cache = self
                 .param_cache
                 .lock()
                 .map_err(|_| MotorError::Io("param cache lock poisoned".into()))?;
             cache.pending_read = Some(endpoint_id);
+            if offset == 0 {
+                cache.raw.remove(&endpoint_id);
+            }
         }
-        let data = encode_param_read(endpoint_id);
+        let data = encode_param_read_at(endpoint_id, offset);
         let can_id = self.cmd_can_id(Priority::Config, MsgType::ParamRead);
         self.send_ext(can_id, data)
     }
@@ -576,9 +629,79 @@ impl CyberBeastMotor {
         self.send_ext(can_id, data)
     }
 
-    /// Read a parameter value, blocking until response or timeout.
+    /// Wait for the value of an SDO endpoint that has already been requested.
+    ///
+    /// This does **not** transmit anything: call [`Self::send_param_read`] first (the
+    /// ABI layer does exactly that). Responses are cached by the background polling
+    /// thread, so calling this without a preceding request always times out.
+    ///
+    /// Only 4-byte float32 endpoints are supported here. When the device answers
+    /// with a different value width (or with a segmented value), the error is
+    /// reported as `Unsupported` with the observed `DataLen` instead of a timeout.
     pub fn get_param_f32(&self, endpoint_id: u16, timeout: Duration) -> Result<f32> {
-        self.wait_for_param(endpoint_id, timeout)
+        let since = Instant::now();
+        match self.wait_for_param(endpoint_id, timeout) {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                let cache = self
+                    .param_cache
+                    .lock()
+                    .map_err(|_| MotorError::Io("param cache lock poisoned".into()))?;
+                match cache.shapes.get(&endpoint_id) {
+                    Some((data_len, more, when)) if *when >= since => {
+                        Err(MotorError::Unsupported(format!(
+                            "endpoint 0x{endpoint_id:04X} answered with {data_len} byte(s){}; \
+                             get_param_f32 handles 4-byte float32 endpoints only \
+                             (use read_param_raw for other widths)",
+                            if *more {
+                                " and the More flag set (segmented value)"
+                            } else {
+                                ""
+                            }
+                        )))
+                    }
+                    _ => Err(err),
+                }
+            }
+        }
+    }
+
+    /// Read an SDO endpoint as raw little-endian bytes, following the More flag.
+    ///
+    /// Unlike [`Self::get_param_f32`] this sends the first request itself, so it can
+    /// read any value width (uint8/uint16/uint32/uint64/float32/float64).
+    pub fn read_param_raw(&self, endpoint_id: u16, timeout: Duration) -> Result<Vec<u8>> {
+        let deadline = Instant::now() + timeout;
+        let mut requested_offset = 0usize;
+        self.send_param_read(endpoint_id)?;
+        loop {
+            let snapshot = {
+                let cache = self
+                    .param_cache
+                    .lock()
+                    .map_err(|_| MotorError::Io("param cache lock poisoned".into()))?;
+                cache
+                    .raw
+                    .get(&endpoint_id)
+                    .cloned()
+                    .zip(cache.shapes.get(&endpoint_id).map(|shape| shape.1))
+            };
+            if let Some((bytes, more)) = snapshot {
+                if !more {
+                    return Ok(bytes);
+                }
+                if bytes.len() > requested_offset {
+                    requested_offset = bytes.len();
+                    self.send_param_read_at(endpoint_id, requested_offset as u32)?;
+                }
+            }
+            if Instant::now() > deadline {
+                return Err(MotorError::Timeout(format!(
+                    "timeout waiting for param read 0x{endpoint_id:04X}",
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(PARAM_POLL_INTERVAL_MS));
+        }
     }
 
     /// Write a parameter value and wait for acknowledgment.
@@ -701,9 +824,9 @@ impl CyberBeastMotor {
                         can_id_parts: parts,
                         // Heartbeat now provides position, velocity, current,
                         // temperature, error flags, and life counter all in one frame.
-                        // Position/velocity are in motor turns — convert to output rad.
-                        pos: hb.position_turns * (2.0 * std::f32::consts::PI),
-                        vel: hb.velocity_turns_per_s * (2.0 * std::f32::consts::PI),
+                        // Position/velocity are motor-side turns → radians.
+                        pos: hb.position_turns * MOTOR_TURNS_TO_RAD,
+                        vel: hb.velocity_turns_per_s * MOTOR_TURNS_TO_RAD,
                         current: hb.iq_current,
                         error_flags: hb.error_flags,
                         motor_temp: hb.motor_temp,
@@ -716,7 +839,10 @@ impl CyberBeastMotor {
 
             // QUERY_POS_VEL response
             t if t == MsgType::QueryPosVel as u8 => {
-                let (pos, vel) = protocol::decode_pos_vel_response(&frame.data);
+                // QUERY_POS_VEL answers with motor-side turns / turns per second
+                // (protocol 4.10.2). Convert like the heartbeat path does, so the
+                // cached state never depends on which frame arrived last.
+                let (pos_turns, vel_turns_per_s) = protocol::decode_pos_vel_response(&frame.data);
                 let mut state = self
                     .state
                     .lock()
@@ -725,8 +851,8 @@ impl CyberBeastMotor {
                 state.replace(CyberBeastMotorState {
                     arbitration_id: frame.arbitration_id,
                     can_id_parts: parts,
-                    pos,
-                    vel,
+                    pos: pos_turns * MOTOR_TURNS_TO_RAD,
+                    vel: vel_turns_per_s * MOTOR_TURNS_TO_RAD,
                     ..existing
                 });
             }
@@ -811,18 +937,12 @@ impl CyberBeastMotor {
 
             // PARAM_READ response
             t if t == MsgType::ParamRead as u8 => {
-                // Parse endpoint_id from response
-                if frame.data.len() >= 3 {
-                    let endpoint_id = ((frame.data[1] as u16) << 8) | (frame.data[2] as u16);
-                    if let Some(val) =
-                        protocol::decode_param_read_response(&frame.data, endpoint_id)
-                    {
-                        let mut cache = self
-                            .param_cache
-                            .lock()
-                            .map_err(|_| MotorError::Io("param cache lock poisoned".into()))?;
-                        cache.record_read_response(endpoint_id, val);
-                    }
+                if let Some(response) = protocol::decode_param_read_frame(&frame.data) {
+                    let mut cache = self
+                        .param_cache
+                        .lock()
+                        .map_err(|_| MotorError::Io("param cache lock poisoned".into()))?;
+                    cache.record_read_frame(&response);
                 }
             }
 

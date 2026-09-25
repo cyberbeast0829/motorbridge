@@ -1,15 +1,16 @@
-use crate::args::{get_f32, get_str, get_u16_hex_or_dec, get_u64};
+use crate::args::{get_f32, get_opt_u16_hex_or_dec, get_str, get_u16_hex_or_dec, get_u64};
 use motor_core::bus::{open_can_bus, CanBus, CanFrame};
 use motor_core::error::Result as MotorResult;
 use motor_vendor_cyberbeast::{
     big_endian_bytes_to_f32, can_id_parts, decode_heartbeat, CyberBeastController, CyberBeastMotor,
-    CyberBeastMotorState, ModeState, MsgType,
+    CyberBeastMotorState, ModeState, MsgType, REGISTER_TABLE,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const QUERY_TIMEOUT_MS: u64 = 200;
+const PARAM_TIMEOUT_MS: u64 = 200;
 
 // ---------------------------------------------------------------------------
 // Ctrl+C / SIGTERM handling for long-running loops
@@ -275,6 +276,99 @@ fn get_torque(args: &HashMap<String, String>) -> Result<f32, String> {
     }
 }
 
+/// `--endpoint` is the canonical spelling; `--param-id` (Python CLI spelling) is accepted too.
+fn get_endpoint(args: &HashMap<String, String>) -> Result<u16, String> {
+    if let Some(value) = get_opt_u16_hex_or_dec(args, "endpoint")? {
+        return Ok(value);
+    }
+    if let Some(value) = get_opt_u16_hex_or_dec(args, "param-id")? {
+        return Ok(value);
+    }
+    Err(
+        "--endpoint <hex|dec> is required for read-param/write-param (alias: --param-id)"
+            .to_string(),
+    )
+}
+
+/// Human-readable name for a documented SDO endpoint, if the static table knows it.
+fn endpoint_name(endpoint: u16) -> Option<&'static str> {
+    REGISTER_TABLE
+        .iter()
+        .find(|info| info.endpoint_id == endpoint)
+        .map(|info| info.variable)
+}
+
+/// Declared value type of a documented SDO endpoint, as reported by the device descriptor.
+fn endpoint_type(endpoint: u16) -> &'static str {
+    REGISTER_TABLE
+        .iter()
+        .find(|info| info.endpoint_id == endpoint)
+        .map(|info| info.value_type)
+        .unwrap_or("unknown")
+}
+
+fn le_array<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
+    bytes.get(..N).and_then(|slice| slice.try_into().ok())
+}
+
+/// Decode little-endian value bytes using the type declared by the device descriptor.
+///
+/// Firmware 0.6.9 answers PARAM_READ with **little-endian** values (verified on
+/// hardware: vbus 23.09 V, torque_constant 0.0824, cpr 16384), even though
+/// protocol 4.7 documents big-endian.
+fn decode_param_value(declared: &str, bytes: &[u8]) -> String {
+    let undecodable = || unknown_value(bytes);
+    match declared.split_whitespace().next().unwrap_or("") {
+        "float" => {
+            le_array::<4>(bytes).map_or_else(undecodable, |b| f32::from_le_bytes(b).to_string())
+        }
+        "uint8" => bytes.first().map_or_else(undecodable, |b| b.to_string()),
+        "int8" => bytes
+            .first()
+            .map_or_else(undecodable, |b| (*b as i8).to_string()),
+        "bool" => bytes
+            .first()
+            .map_or_else(undecodable, |b| (*b != 0).to_string()),
+        "uint16" => {
+            le_array::<2>(bytes).map_or_else(undecodable, |b| u16::from_le_bytes(b).to_string())
+        }
+        "int16" => {
+            le_array::<2>(bytes).map_or_else(undecodable, |b| i16::from_le_bytes(b).to_string())
+        }
+        "uint32" => {
+            le_array::<4>(bytes).map_or_else(undecodable, |b| u32::from_le_bytes(b).to_string())
+        }
+        "int32" => {
+            le_array::<4>(bytes).map_or_else(undecodable, |b| i32::from_le_bytes(b).to_string())
+        }
+        "uint64" => {
+            le_array::<8>(bytes).map_or_else(undecodable, |b| u64::from_le_bytes(b).to_string())
+        }
+        _ => {
+            let as_f32 = le_array::<4>(bytes).map(f32::from_le_bytes);
+            let as_i32 = le_array::<4>(bytes).map(i32::from_le_bytes);
+            match (as_f32, as_i32) {
+                (Some(f), Some(i)) => format!(
+                    "{f} (if float32 LE) / {i} (if int32 LE); type unknown for this endpoint"
+                ),
+                _ => unknown_value(bytes),
+            }
+        }
+    }
+}
+
+fn unknown_value(bytes: &[u8]) -> String {
+    format!(
+        "(no decoder for {} byte(s): {})",
+        bytes.len(),
+        bytes
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
 pub fn run_cyberbeast(
     args: &HashMap<String, String>,
     channel: &str,
@@ -369,13 +463,19 @@ pub fn run_cyberbeast(
             }
             match snapshot.pos_vel {
                 Some((pos, vel)) => println!(
-                    "  query-posvel: pos={pos:.6} vel={vel:.6} (float32 BE exactly as reported; turns-vs-rad unverified)"
+                    "  query-posvel: pos={pos:.6} rad vel={vel:.6} rad/s (motor-side turns reported by the device, converted to rad)"
                 ),
                 None => println!("  query-posvel: no response to QueryPosVel (0x41)"),
             }
             match snapshot.device_info {
                 Some((hw, fw)) => println!(
-                    "  device-info : hw=0x{hw:08X} fw=0x{fw:08X} (hw/fw field split pending protocol-doc confirmation)"
+                    "  device-info : hw=0x{hw:08X} ({}.{}.{}) fw=0x{fw:08X} ({}.{}.{})",
+                    (hw >> 16) & 0xFF,
+                    (hw >> 8) & 0xFF,
+                    hw & 0xFF,
+                    (fw >> 16) & 0xFF,
+                    (fw >> 8) & 0xFF,
+                    fw & 0xFF
                 ),
                 None => println!("  device-info : no response to QueryDeviceInfo (0x46)"),
             }
@@ -532,10 +632,10 @@ pub fn run_cyberbeast(
         "estop" => {
             let motor = ctrl.add_motor(motor_id, motor_id, model)?;
             println!(
-                "warning: sending ESTOP (MsgType 0xC0). 0xC0 is a broadcast-class message type (>= 0x80); this implementation fills dest=0x{motor_id:02X}, but if the firmware treats 0xC0 as broadcast it affects every node on the bus"
+                "warning: ESTOP is a global broadcast (Priority=0, MsgType=0xC0, Dest=0xFF per protocol 4.9): every device on {channel} stops and latches an ESTOP error, cleared only by clear-error or a reset"
             );
             motor.send_estop()?;
-            println!("estop (0xC0) sent to 0x{motor_id:02X}");
+            println!("estop broadcast sent (Priority=0, mt=0xC0, dest=0xFF)");
             ctrl.shutdown()?;
         }
 
@@ -558,6 +658,79 @@ pub fn run_cyberbeast(
             println!(
                 "set-zero (0x61) sent to 0x{motor_id:02X}; re-read status to confirm the new zero"
             );
+            ctrl.shutdown()?;
+        }
+
+        // SDO endpoint read/write (fibre endpoint system, protocol 4.7 / 4.8).
+        "read-param" => {
+            let endpoint = get_endpoint(args)?;
+            let timeout_ms = get_u64(args, "timeout-ms", PARAM_TIMEOUT_MS)?;
+            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            // read_param_raw sends the request itself and follows the More flag, so
+            // it works for every value width, not just 4-byte float32.
+            let bytes = motor.read_param_raw(endpoint, Duration::from_millis(timeout_ms))?;
+            let name = endpoint_name(endpoint).unwrap_or("not in the verified endpoint table");
+            let declared = endpoint_type(endpoint);
+            println!(
+                "endpoint 0x{endpoint:04X} ({name}) declared={declared} value={}",
+                decode_param_value(declared, &bytes)
+            );
+            println!(
+                "  raw little-endian bytes: [{}]",
+                bytes
+                    .iter()
+                    .map(|b| format!("{b:02X}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            ctrl.shutdown()?;
+        }
+
+        "write-param" => {
+            let endpoint = get_endpoint(args)?;
+            if !args.contains_key("value") {
+                return Err("--value <float> is required for write-param".into());
+            }
+            if !args.contains_key("yes") {
+                return Err(
+                    "write-param changes device configuration; re-run with --yes to confirm".into(),
+                );
+            }
+            let requested = get_f32(args, "value", 0.0)?;
+            let timeout_ms = get_u64(args, "timeout-ms", PARAM_TIMEOUT_MS)?;
+            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            motor.send_param_read(endpoint)?;
+            let before = motor
+                .get_param_f32(endpoint, Duration::from_millis(timeout_ms))
+                .ok();
+            motor.set_param_f32(endpoint, requested)?;
+            motor.send_param_read(endpoint)?;
+            let read_back = motor
+                .get_param_f32(endpoint, Duration::from_millis(timeout_ms))
+                .ok();
+            let name = endpoint_name(endpoint).unwrap_or("?");
+            println!(
+                "endpoint 0x{endpoint:04X} ({name}): requested={requested} before={before:?} read_back={read_back:?}"
+            );
+            match read_back {
+                Some(value) => {
+                    let delta = (value - requested).abs();
+                    if delta <= f32::EPSILON * requested.abs().max(1.0) {
+                        println!("  verified: the device reports the requested value");
+                    } else {
+                        return Err(format!(
+                            "read-back mismatch on endpoint 0x{endpoint:04X}: requested {requested}, device reports {value} (delta {delta})"
+                        )
+                        .into());
+                    }
+                }
+                None => {
+                    return Err(format!(
+                        "endpoint 0x{endpoint:04X} write was acknowledged but could not be read back; treat it as unverified"
+                    )
+                    .into());
+                }
+            }
             ctrl.shutdown()?;
         }
 
@@ -682,7 +855,7 @@ pub fn run_cyberbeast(
 
         other => {
             eprintln!(
-                "unknown mode: {other}. Supported: scan, status, mit, pos, vel, torque, enable, disable, estop, clear-error, set-zero, monitor, keep-alive"
+                "unknown mode: {other}. Supported: scan, status, mit, pos, vel, torque, enable, disable, estop, clear-error, set-zero, read-param, write-param, monitor, keep-alive"
             );
             ctrl.shutdown()?;
         }

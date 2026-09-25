@@ -226,19 +226,25 @@ MyActuator modes:\n\
 Hexfellow modes:\n\
   --mode scan | status | enable | disable | pos-vel | mit\n\n\
 CyberBeast modes:\n\
-  --mode scan | status | mit | pos | vel | torque | enable | disable | estop | clear-error | set-zero | monitor | keep-alive\n\
+  --mode scan | status | mit | pos | vel | torque | enable | disable | estop | clear-error | set-zero | read-param | write-param | monitor | keep-alive\n\
   scan and status are query-only: they never send StartMotor/StopMotor.\n\
   monitor is fully passive (no frame is transmitted). keep-alive sends QueryStatus/QueryPosVel only.\n\
-  estop uses MsgType 0xC0, a broadcast-class message type.\n\
-  set-zero requires --yes (it changes the mechanical zero reference).\n\n\
+  estop is a global broadcast (Priority=0, MsgType=0xC0, Dest=0xFF): every device on\n\
+  the bus stops and latches an ESTOP error, cleared only by clear-error or a reset.\n\
+  set-zero and write-param require --yes.\n\n\
 CyberBeast extras:\n\
   --trace              print every TX/RX frame with decoded 29-bit id fields and heartbeat payload\n\
   --tau <float>        alias of --torque for --mode mit\n\
   --loop-ms <ms>       control loop period, default 5 (mit/torque) or 10 (pos/vel)\n\
   --vel-limit <rpm>    pos mode velocity limit, default 100\n\
   --cur-limit <A>      pos/vel mode current limit, default 200 (<= 0 means unspecified)\n\
+  --endpoint <hex|dec> SDO endpoint for read-param/write-param (alias: --param-id)\n\
+  --value <float>      value for write-param; the write is read back and verified\n\
+  --timeout-ms <ms>    SDO response timeout, default 200\n\
   --keep-alive-ms <ms> keep-alive query period, default 500\n\
-  --duration-s <s>     run time for monitor/keep-alive, 0 = until Ctrl+C\n\n\
+  --duration-s <s>     run time for monitor/keep-alive, 0 = until Ctrl+C\n\
+  position/velocity are motor-side rad (motor turns x 2*pi); MIT/POS/VEL commands\n\
+  carry output-side units, so compare them only when the gear ratio is 1.\n\n\
 \n\
 Common args:\n\
   --transport   auto|socketcan|socketcanfd|dm-serial|dm-device (default auto; dm-serial/dm-device are Damiao-only)\n\

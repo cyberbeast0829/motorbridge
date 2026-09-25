@@ -775,14 +775,25 @@ pub fn encode_query_error(err_type: u8) -> [u8; 8] {
 //   Byte 4-7:  reserved (0)
 // ============================================================================
 
-/// Encode a PARAM_READ request frame for an ODrive SDO endpoint.
+/// Encode a PARAM_READ request frame for an ODrive SDO endpoint (offset 0).
 pub fn encode_param_read(endpoint_id: u16) -> [u8; 8] {
+    encode_param_read_at(endpoint_id, 0)
+}
+
+/// Encode a PARAM_READ request for a specific byte offset inside the value.
+///
+/// Protocol 4.7: `Flags | EndpointID(u16 BE) | ReqLen | Offset(u32 BE)`.
+/// `ReqLen` is the number of bytes wanted in this chunk (4 on classic CAN: the
+/// 8-byte frame holds a 4-byte header plus 4 bytes of value). Values longer than
+/// 4 bytes are read chunk by chunk, following the response's More flag
+/// (see [`ParamReadResponse::more`]).
+pub fn encode_param_read_at(endpoint_id: u16, offset: u32) -> [u8; 8] {
     let mut buf = [0u8; 8];
     buf[0] = 0x00; // flags
     buf[1] = (endpoint_id >> 8) as u8;
     buf[2] = endpoint_id as u8;
-    buf[3] = 0x00; // data_len = 0 (read request)
-                   // bytes 4-7 remain zero
+    buf[3] = 4; // ReqLen: 4 bytes per classic-CAN chunk
+    buf[4..8].copy_from_slice(&offset.to_be_bytes());
     buf
 }
 
@@ -797,20 +808,94 @@ pub fn encode_param_write(endpoint_id: u16, value: f32) -> [u8; 8] {
     buf
 }
 
-/// Decode a PARAM_READ response value (float32 BE).
-/// Returns `None` if the frame is not a valid read response.
+/// PARAM_READ response (protocol 4.7): `Flags | EndpointID(u16 BE) | DataLen | Value`.
+///
+/// `flags & 0x80` is the **More** flag: the value continues, so the host repeats
+/// the request with `Offset += data_len` and concatenates the chunks.
+///
+/// Value byte order: protocol 4.7 documents big-endian, but firmware 0.6.9 sends
+/// **little-endian** values. Verified on hardware:
+/// - `vbus_voltage` (0x0002) answers `26 B7 B8 41` = 23.09 V as little-endian
+///   float32 (big-endian would decode to 4.5e-15)
+/// - `axis0.motor.config.torque_constant` (0x00F7) answers `AF D9 A8 3D` = 0.0824
+/// - `axis0.encoder.config.cpr` (0x0186) answers `00 40 00 00` = 16384 as int32
+#[derive(Debug, Clone, Copy)]
+pub struct ParamReadResponse {
+    pub flags: u8,
+    pub endpoint_id: u16,
+    pub data_len: u8,
+    pub more: bool,
+    /// Little-endian value bytes, zero-padded to 8.
+    pub raw: [u8; 8],
+}
+
+impl ParamReadResponse {
+    pub fn as_f32(&self) -> Option<f32> {
+        (self.data_len == 4)
+            .then(|| f32::from_le_bytes([self.raw[0], self.raw[1], self.raw[2], self.raw[3]]))
+    }
+
+    pub fn as_u32(&self) -> Option<u32> {
+        (self.data_len == 4)
+            .then(|| u32::from_le_bytes([self.raw[0], self.raw[1], self.raw[2], self.raw[3]]))
+    }
+
+    pub fn as_i32(&self) -> Option<i32> {
+        self.as_u32().map(|value| value as i32)
+    }
+
+    pub fn as_u16(&self) -> Option<u16> {
+        (self.data_len == 2).then(|| u16::from_le_bytes([self.raw[0], self.raw[1]]))
+    }
+
+    pub fn as_i16(&self) -> Option<i16> {
+        self.as_u16().map(|value| value as i16)
+    }
+
+    pub fn as_u8(&self) -> Option<u8> {
+        (self.data_len == 1).then_some(self.raw[0])
+    }
+
+    pub fn as_i8(&self) -> Option<i8> {
+        self.as_u8().map(|value| value as i8)
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        self.as_u8().map(|value| value != 0)
+    }
+}
+
+/// Decode a PARAM_READ response frame, whatever the value width.
+pub fn decode_param_read_frame(data: &[u8]) -> Option<ParamReadResponse> {
+    if data.len() < 4 {
+        return None;
+    }
+    let data_len = data[3];
+    if data_len as usize + 4 > data.len() {
+        return None;
+    }
+    let mut raw = [0u8; 8];
+    raw[..data_len as usize].copy_from_slice(&data[4..4 + data_len as usize]);
+    Some(ParamReadResponse {
+        flags: data[0],
+        endpoint_id: ((data[1] as u16) << 8) | (data[2] as u16),
+        data_len,
+        more: data[0] & 0x80 != 0,
+        raw,
+    })
+}
+
+/// Decode a complete little-endian float32 PARAM_READ response.
+///
+/// Returns `None` for other value widths, and for a response that is only the
+/// first chunk of a longer value (More flag set): use [`decode_param_read_frame`]
+/// plus [`ParamReadResponse::as_f32`] to handle those explicitly.
 pub fn decode_param_read_response(data: &[u8], expected_endpoint_id: u16) -> Option<f32> {
-    if data.len() < 8 {
+    let response = decode_param_read_frame(data)?;
+    if response.endpoint_id != expected_endpoint_id || response.more {
         return None;
     }
-    let endpoint_id = ((data[1] as u16) << 8) | (data[2] as u16);
-    if endpoint_id != expected_endpoint_id {
-        return None;
-    }
-    if data[3] != 4 {
-        return None;
-    }
-    Some(big_endian_bytes_to_f32(data, 4))
+    response.as_f32()
 }
 
 /// Check if a frame is a PARAM_WRITE acknowledgment (silent confirmation).
@@ -860,7 +945,16 @@ mod tests {
         assert_eq!(data[0], 0x00); // flags
         assert_eq!(data[1], 0x00); // endpoint_id high
         assert_eq!(data[2], 0x1C); // endpoint_id low
-        assert_eq!(data[3], 0x00); // data_len = 0
+        assert_eq!(data[3], 0x04); // ReqLen = 4 bytes per classic-CAN chunk
+        assert_eq!(&data[4..8], &[0, 0, 0, 0]); // offset 0
+    }
+
+    #[test]
+    fn test_encode_param_read_at_sets_offset() {
+        // Segmented reads walk the value with Offset (big-endian per protocol 4.7).
+        let data = encode_param_read_at(0x0005, 4);
+        assert_eq!(data[3], 0x04);
+        assert_eq!(&data[4..8], &[0, 0, 0, 4]);
     }
 
     #[test]
@@ -873,18 +967,53 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_param_read_response() {
-        // Create a valid read response: endpoint 0x001C, value 10.0
-        let mut data = [0u8; 8];
-        data[0] = 0x00;
-        data[1] = 0x00;
-        data[2] = 0x1C;
-        data[3] = 0x04;
-        f32_to_big_endian_bytes(10.0, &mut data, 4);
+    fn test_decode_param_read_response_is_little_endian() {
+        // Captured on hardware (fw 0.6.9): odrv.vbus_voltage (0x0002) answered
+        // 23.09 V as **little-endian** float32, although protocol 4.7 documents
+        // big-endian (which would decode to 4.5e-15).
+        let data = [0x00, 0x00, 0x02, 0x04, 0x26, 0xB7, 0xB8, 0x41];
+        let value = decode_param_read_response(&data, 0x0002).expect("valid float32 response");
+        assert!((value - 23.09).abs() < 0.01, "got {value}");
 
-        let val = decode_param_read_response(&data, 0x001C);
-        assert!(val.is_some());
-        assert!((val.unwrap() - 10.0).abs() < 0.001);
+        // axis0.motor.config.torque_constant (0x00F7) answered 0.0824 Nm/A.
+        let data = [0x00, 0x00, 0xF7, 0x04, 0xAF, 0xD9, 0xA8, 0x3D];
+        let value = decode_param_read_response(&data, 0x00F7).expect("valid float32 response");
+        assert!((value - 0.0824).abs() < 0.001, "got {value}");
+    }
+
+    #[test]
+    fn test_decode_param_read_frame_typed_accessors() {
+        // axis0.encoder.config.cpr (0x0186) answered 16384 as int32 (little-endian).
+        let data = [0x00, 0x01, 0x86, 0x04, 0x00, 0x40, 0x00, 0x00];
+        let response = decode_param_read_frame(&data).expect("valid frame");
+        assert_eq!(response.endpoint_id, 0x0186);
+        assert_eq!(response.data_len, 4);
+        assert!(!response.more);
+        assert_eq!(response.as_i32(), Some(16384));
+
+        // axis0.current_state (0x008E) answered 1 as uint8.
+        let data = [0x00, 0x00, 0x8E, 0x01, 0x01];
+        let response = decode_param_read_frame(&data).expect("valid frame");
+        assert_eq!(response.as_u8(), Some(1));
+        assert_eq!(response.as_i32(), None);
+    }
+
+    #[test]
+    fn test_decode_param_read_frame_marks_segmented_values() {
+        // odrv.serial_number (0x0005, uint64) first chunk: Flags bit7 = More.
+        let data = [0x80, 0x00, 0x05, 0x04, 0x50, 0x34, 0x66, 0x0D];
+        let response = decode_param_read_frame(&data).expect("valid frame");
+        assert!(response.more);
+        assert_eq!(response.data_len, 4);
+        // The complete-value helper must never report a partial chunk as the value.
+        assert!(decode_param_read_response(&data, 0x0005).is_none());
+    }
+
+    #[test]
+    fn test_decode_param_read_frame_rejects_truncated_payload() {
+        // DataLen claims 4 bytes but only 2 are present.
+        let data = [0x00, 0x00, 0x02, 0x04, 0x26, 0xB7];
+        assert!(decode_param_read_frame(&data).is_none());
     }
 
     #[test]
