@@ -75,6 +75,9 @@ fn is_mode_word(s: &str) -> bool {
             | "timed-read"
             | "clear-error"
             | "clear-fault"
+            | "estop"
+            | "monitor"
+            | "keep-alive"
             | "quick-stop"
             | "emergency-stop"
             | "watchdog"
@@ -202,6 +205,7 @@ Vendors:\n\
   --vendor robstride\n\
   --vendor hightorque (native ht_can v1.5.5 direct-CAN mode)\n\
   --vendor hexfellow (CANopen over dedicated CAN-FD path)\n\
+  --vendor cyberbeast (ODrive SDO/CAN node over classic CAN; no CAN-FD transport)\n\
   --vendor robstride_cia402 (RobStride CANopen/CiA402 over classic CAN; experimental/incomplete)\n\
   --vendor robstride_mit (RobStride F_CMD=2 MIT protocol over classic CAN standard frames; experimental/incomplete)\n\
   --vendor myactuator\n\
@@ -221,6 +225,20 @@ MyActuator modes:\n\
 \n\
 Hexfellow modes:\n\
   --mode scan | status | enable | disable | pos-vel | mit\n\n\
+CyberBeast modes:\n\
+  --mode scan | status | mit | pos | vel | torque | enable | disable | estop | clear-error | set-zero | monitor | keep-alive\n\
+  scan and status are query-only: they never send StartMotor/StopMotor.\n\
+  monitor is fully passive (no frame is transmitted). keep-alive sends QueryStatus/QueryPosVel only.\n\
+  estop uses MsgType 0xC0, a broadcast-class message type.\n\
+  set-zero requires --yes (it changes the mechanical zero reference).\n\n\
+CyberBeast extras:\n\
+  --trace              print every TX/RX frame with decoded 29-bit id fields and heartbeat payload\n\
+  --tau <float>        alias of --torque for --mode mit\n\
+  --loop-ms <ms>       control loop period, default 5 (mit/torque) or 10 (pos/vel)\n\
+  --vel-limit <rpm>    pos mode velocity limit, default 100\n\
+  --cur-limit <A>      pos/vel mode current limit, default 200 (<= 0 means unspecified)\n\
+  --keep-alive-ms <ms> keep-alive query period, default 500\n\
+  --duration-s <s>     run time for monitor/keep-alive, 0 = until Ctrl+C\n\n\
 \n\
 Common args:\n\
   --transport   auto|socketcan|socketcanfd|dm-serial|dm-device (default auto; dm-serial/dm-device are Damiao-only)\n\
@@ -229,9 +247,9 @@ Common args:\n\
   --serial-baud  default 921600 (used when --transport dm-serial)\n\
   --dm-device-type  usb2canfd|usb2canfd-dual|linkx4c, default usb2canfd-dual (used when --transport dm-device)\n\
   --dm-channel      SDK channel number: usb2canfd=0, usb2canfd-dual=0|1, linkx4c=0|1|2|3 (control default 0; scan omitted scans all)\n\
-  --model        default depends on vendor (damiao=4340, robstride=rs-00, robstride_cia402=rs-00, robstride_mit=rs-00, hightorque=hightorque[hint only], myactuator=X8)\n\
+  --model        default depends on vendor (damiao=4340, robstride=rs-00, robstride_cia402=rs-00, robstride_mit=rs-00, hightorque=hightorque[hint only], myactuator=X8, cyberbeast=odrive-default)\n\
   --motor-id     default 0x01\n\
-  --feedback-id  default 0x11 for Damiao, 0xFD for RobStride/RobStride MIT host_id, ignored/0 for RobStride CiA402, 0x01 for HighTorque, 0x241 for MyActuator\n\
+  --feedback-id  default 0x11 for Damiao, 0xFD for RobStride/RobStride MIT host_id, ignored/0 for RobStride CiA402, 0x01 for HighTorque, 0x241 for MyActuator, ignored for CyberBeast (commands and feedback are addressed by motor_id)\n\
   --loop         send cycles, default 1\n\
   --dt-ms        period ms, default 20\n\
   --ensure-mode  1/0, default 1\n\n\

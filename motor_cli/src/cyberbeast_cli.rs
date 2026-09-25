@@ -1,9 +1,279 @@
 use crate::args::{get_f32, get_str, get_u16_hex_or_dec, get_u64};
-use motor_vendor_cyberbeast::CyberBeastController;
+use motor_core::bus::{open_can_bus, CanBus, CanFrame};
+use motor_core::error::Result as MotorResult;
+use motor_vendor_cyberbeast::{
+    big_endian_bytes_to_f32, can_id_parts, decode_heartbeat, CyberBeastController, CyberBeastMotor,
+    CyberBeastMotorState, ModeState, MsgType,
+};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-const SCAN_TIMEOUT_MS: u64 = 200;
+const QUERY_TIMEOUT_MS: u64 = 200;
+
+// ---------------------------------------------------------------------------
+// Ctrl+C / SIGTERM handling for long-running loops
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod sigint {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn handle_stop_signal(_sig: i32) {
+        STOP_REQUESTED.store(true, Ordering::SeqCst);
+    }
+
+    unsafe extern "C" {
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+
+    /// Install handlers so an interrupted loop can send StopMotor before exiting.
+    pub fn install() {
+        // `function_casts_as_integer` requires going through a pointer first.
+        let handler = handle_stop_signal as *const () as usize;
+        unsafe {
+            signal(SIGINT, handler);
+            signal(SIGTERM, handler);
+        }
+    }
+
+    pub fn stop_requested() -> bool {
+        STOP_REQUESTED.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(not(unix))]
+mod sigint {
+    /// No handler on this platform: Ctrl+C terminates the process directly.
+    pub fn install() {}
+
+    pub fn stop_requested() -> bool {
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Optional frame trace (--trace)
+// ---------------------------------------------------------------------------
+
+struct TracingBus {
+    inner: Arc<dyn CanBus>,
+}
+
+impl CanBus for TracingBus {
+    fn send(&self, frame: CanFrame) -> MotorResult<()> {
+        eprintln!(
+            "[cb TX] id=0x{:08X} {}",
+            frame.arbitration_id,
+            frame_text(&frame)
+        );
+        self.inner.send(frame)
+    }
+
+    fn recv(&self, timeout: Duration) -> MotorResult<Option<CanFrame>> {
+        let frame = self.inner.recv(timeout)?;
+        if let Some(f) = frame.as_ref() {
+            eprintln!(
+                "[cb RX] id=0x{:08X} {}{}",
+                f.arbitration_id,
+                frame_text(f),
+                payload_suffix(f)
+            );
+        }
+        Ok(frame)
+    }
+
+    fn shutdown(&self) -> MotorResult<()> {
+        self.inner.shutdown()
+    }
+}
+
+fn msg_type_name(msg_type: u8) -> &'static str {
+    match msg_type {
+        0x00 => "mit",
+        0x01 => "pos",
+        0x02 => "vel",
+        0x03 => "torque",
+        0x04 => "current",
+        0x20 => "param-read",
+        0x21 => "param-write",
+        0x22 => "config-save",
+        0x23 => "config-reset",
+        0x24 => "json-desc-read",
+        0x25 => "json-desc-data",
+        0x40 => "query-status",
+        0x41 => "query-posvel",
+        0x42 => "query-current",
+        0x43 => "query-temp",
+        0x44 => "query-bus",
+        0x45 => "query-error",
+        0x46 => "query-devinfo",
+        0x47 => "query-power",
+        0x48 => "heartbeat",
+        0x49 => "status-feedback",
+        0x60 => "set-node-id",
+        0x61 => "set-zero",
+        0x62 => "start-motor",
+        0x63 => "stop-motor",
+        0x64 => "reset-device",
+        0x65 => "clear-errors",
+        0x80 => "mit-broadcast",
+        0x81 => "pos-broadcast",
+        0x82 => "vel-broadcast",
+        0x83 => "torque-broadcast",
+        0xC0 => "estop",
+        0xC1 => "fault-alert",
+        _ => "unknown",
+    }
+}
+
+fn frame_text(frame: &CanFrame) -> String {
+    let parts = can_id_parts(frame.arbitration_id);
+    let data: Vec<String> = frame
+        .data
+        .iter()
+        .take(frame.dlc as usize)
+        .map(|b| format!("{b:02X}"))
+        .collect();
+    format!(
+        "pri={} mt=0x{:02X}({}) dest={} src={} seq={} dlc={} data=[{}]",
+        parts.priority,
+        parts.msg_type,
+        msg_type_name(parts.msg_type),
+        parts.dest,
+        parts.source,
+        parts.seq,
+        frame.dlc,
+        data.join(" ")
+    )
+}
+
+/// Extra decoding appended to received-frame trace lines.
+fn payload_suffix(frame: &CanFrame) -> String {
+    let msg_type = can_id_parts(frame.arbitration_id).msg_type;
+    if msg_type == MsgType::Heartbeat as u8 {
+        return match decode_heartbeat(&frame.data) {
+            Some(hb) => format!(
+                "  => life={} errflags=0x{:02X} state={} mode={} temp={:.1}C pos={:.3}turns vel={:.3}turns/s iq={:.1}A",
+                hb.life_counter,
+                hb.error_flags,
+                hb.motor_state,
+                hb.control_mode,
+                hb.motor_temp,
+                hb.position_turns,
+                hb.velocity_turns_per_s,
+                hb.iq_current
+            ),
+            None => String::new(),
+        };
+    }
+    // 0x41/0x42/0x43/0x44 all answer with two big-endian float32 values.
+    let pair_label = match msg_type {
+        0x41 => "pos,vel",
+        0x42 => "iq,id",
+        0x43 => "motor_temp,fet_temp",
+        0x44 => "vbus,ibus",
+        _ => return String::new(),
+    };
+    format!(
+        "  => {pair_label} = {:.6}, {:.6} (float32 BE)",
+        big_endian_bytes_to_f32(&frame.data, 0),
+        big_endian_bytes_to_f32(&frame.data, 4)
+    )
+}
+
+/// The mode/error nibbles only exist in MIT response frames. A heartbeat replaces the
+/// cached state without touching them, so never report the leftover value as current.
+fn mode_text(state: &CyberBeastMotorState) -> String {
+    if state.can_id_parts.msg_type == MsgType::Heartbeat as u8 {
+        "n/a(hb)".to_string()
+    } else {
+        format!(
+            "{}({})",
+            state.mode_state,
+            ModeState::name(state.mode_state)
+        )
+    }
+}
+
+fn error_text(state: &CyberBeastMotorState) -> String {
+    if state.can_id_parts.msg_type == MsgType::Heartbeat as u8 {
+        "n/a(hb)".to_string()
+    } else {
+        format!("0x{:X}", state.error_code)
+    }
+}
+
+fn progress_line(state: &CyberBeastMotorState) -> String {
+    format!(
+        "pos={:.4} vel={:.4} cur={:.3}A err={} mode={} temp={:.1}C life={} errflags=0x{:02X}",
+        state.pos,
+        state.vel,
+        state.current,
+        error_text(state),
+        mode_text(state),
+        state.motor_temp,
+        state.heartbeat_life,
+        state.error_flags
+    )
+}
+
+/// Newest view of each frame type collected during a read window.
+#[derive(Default)]
+struct Snapshot {
+    heartbeat: Option<String>,
+    mit: Option<(u8, u8, f32, f32, f32)>,
+    pos_vel: Option<(f32, f32)>,
+    device_info: Option<(u32, u32)>,
+}
+
+/// Poll the bus for a fixed window, latching the newest view of each frame type.
+fn pump(
+    ctrl: &CyberBeastController,
+    motor: &Arc<CyberBeastMotor>,
+    window_ms: u64,
+    snapshot: &mut Snapshot,
+) {
+    let deadline = Instant::now() + Duration::from_millis(window_ms);
+    while Instant::now() < deadline {
+        let _ = ctrl.poll_feedback_once();
+        if let Some(state) = motor.latest_state() {
+            let msg_type = state.can_id_parts.msg_type;
+            if msg_type == MsgType::Heartbeat as u8 {
+                snapshot.heartbeat = Some(progress_line(&state));
+            } else if msg_type == MsgType::MitControl as u8 {
+                snapshot.mit = Some((
+                    state.mode_state,
+                    state.error_code,
+                    state.current,
+                    state.motor_temp,
+                    state.mos_temp,
+                ));
+            } else if msg_type == MsgType::QueryPosVel as u8 {
+                snapshot.pos_vel = Some((state.pos, state.vel));
+            } else if msg_type == MsgType::QueryDeviceInfo as u8 {
+                if let (Some(hw), Some(fw)) = (state.hw_version, state.fw_version) {
+                    snapshot.device_info = Some((hw, fw));
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// `--tau` is accepted as an alias of `--torque` for consistency with other vendors.
+fn get_torque(args: &HashMap<String, String>) -> Result<f32, String> {
+    if args.contains_key("tau") {
+        get_f32(args, "tau", 0.0)
+    } else {
+        get_f32(args, "torque", 0.0)
+    }
+}
 
 pub fn run_cyberbeast(
     args: &HashMap<String, String>,
@@ -13,175 +283,406 @@ pub fn run_cyberbeast(
     _feedback_id: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mode = get_str(args, "mode", "status");
-    let ctrl = CyberBeastController::new_socketcan(channel)?;
+    let ctrl = if args.contains_key("trace") {
+        CyberBeastController::new(Arc::new(TracingBus {
+            inner: open_can_bus(channel)?,
+        }))
+    } else {
+        CyberBeastController::new_socketcan(channel)?
+    };
 
     match mode.as_str() {
         "scan" => {
             let start_id = get_u16_hex_or_dec(args, "start-id", 1)?;
             let end_id = get_u16_hex_or_dec(args, "end-id", 32)?;
-            println!("scanning CyberBeast motors on {channel} (IDs {start_id}..{end_id})...");
+            if end_id < start_id {
+                return Err(format!(
+                    "--end-id 0x{end_id:02X} is below --start-id 0x{start_id:02X}"
+                )
+                .into());
+            }
+            println!(
+                "scanning CyberBeast motors on {channel} (IDs {start_id}..{end_id}); query-only: no StartMotor/StopMotor frame is sent"
+            );
 
+            let mut responders = 0u32;
             for id in start_id..=end_id {
                 let motor = match ctrl.add_motor(id, id, model) {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
-                let _ = motor.send_start_motor();
                 let _ = motor.send_query_status();
-                std::thread::sleep(Duration::from_millis(SCAN_TIMEOUT_MS));
+                std::thread::sleep(Duration::from_millis(QUERY_TIMEOUT_MS));
                 let _ = ctrl.poll_feedback_once();
 
                 if let Some(state) = motor.latest_state() {
+                    responders += 1;
                     println!(
-                        "  [found] id=0x{id:02X} pos={:.3} vel={:.3} current={:.3} err=0x{:X} mode={} motor_temp={:.1}°C mos_temp={:.1}°C",
-                        state.pos, state.vel, state.current, state.error_code, state.mode_state, state.motor_temp, state.mos_temp
+                        "  [found] id=0x{id:02X} pos={:.4} vel={:.4} [source mt=0x{:02X} ({})]",
+                        state.pos,
+                        state.vel,
+                        state.can_id_parts.msg_type,
+                        msg_type_name(state.can_id_parts.msg_type)
+                    );
+                    println!(
+                        "          current={:.3} A err={} mode={} motor_temp={:.1}C mos_temp={:.1}C life={} errflags=0x{:02X}",
+                        state.current,
+                        error_text(&state),
+                        mode_text(&state),
+                        state.motor_temp,
+                        state.mos_temp,
+                        state.heartbeat_life,
+                        state.error_flags
                     );
                 }
-                let _ = motor.send_stop_motor();
             }
+            println!("scan done: {responders} device(s) responded");
             ctrl.shutdown()?;
         }
 
         "status" => {
             let motor = ctrl.add_motor(motor_id, motor_id, model)?;
-            let _ = motor.send_start_motor();
+            println!(
+                "status for motor 0x{motor_id:02X} on {channel} (query-only: no StartMotor/StopMotor frame is sent)"
+            );
+            let mut snapshot = Snapshot::default();
             let _ = motor.send_query_status();
-            std::thread::sleep(Duration::from_millis(SCAN_TIMEOUT_MS));
-            let _ = ctrl.poll_feedback_once();
+            pump(&ctrl, &motor, QUERY_TIMEOUT_MS + 100, &mut snapshot);
+            let _ = motor.send_query_pos_vel();
+            pump(&ctrl, &motor, QUERY_TIMEOUT_MS + 100, &mut snapshot);
+            let _ = motor.send_query_device_info();
+            pump(&ctrl, &motor, QUERY_TIMEOUT_MS + 100, &mut snapshot);
 
-            if let Some(state) = motor.latest_state() {
-                println!("status for motor 0x{motor_id:02X}:");
-                println!("  pos={:.4} rad, vel={:.4} rad/s", state.pos, state.vel);
-                println!(
-                    "  current={:.3} A, error=0x{:X}, mode={}",
-                    state.current, state.error_code, state.mode_state
-                );
-                println!(
-                    "  motor_temp={:.1}°C, mos_temp={:.1}°C",
-                    state.motor_temp, state.mos_temp
-                );
-                println!(
-                    "  heartbeat_life={} error_flags=0x{:02X}",
-                    state.heartbeat_life, state.error_flags
-                );
-            } else {
-                println!("no response from motor 0x{motor_id:02X}");
+            println!(
+                "  heartbeat   : {}",
+                snapshot
+                    .heartbeat
+                    .as_deref()
+                    .unwrap_or("no heartbeat received (is the device powered?)")
+            );
+            match snapshot.mit {
+                Some((mode, err, current, motor_temp, mos_temp)) => println!(
+                    "  query-status: mode={mode}({}) err=0x{err:X} current={current:.3}A motor_temp={motor_temp:.1}C mos_temp={mos_temp:.1}C",
+                    ModeState::name(mode)
+                ),
+                None => println!("  query-status: no response to QueryStatus (0x40)"),
             }
-            let _ = motor.send_stop_motor();
+            match snapshot.pos_vel {
+                Some((pos, vel)) => println!(
+                    "  query-posvel: pos={pos:.6} vel={vel:.6} (float32 BE exactly as reported; turns-vs-rad unverified)"
+                ),
+                None => println!("  query-posvel: no response to QueryPosVel (0x41)"),
+            }
+            match snapshot.device_info {
+                Some((hw, fw)) => println!(
+                    "  device-info : hw=0x{hw:08X} fw=0x{fw:08X} (hw/fw field split pending protocol-doc confirmation)"
+                ),
+                None => println!("  device-info : no response to QueryDeviceInfo (0x46)"),
+            }
             ctrl.shutdown()?;
         }
 
         "mit" => {
             let motor = ctrl.add_motor(motor_id, motor_id, model)?;
-            println!("starting MIT control for motor 0x{motor_id:02X} (Ctrl+C to stop)...");
-            let _ = motor.send_start_motor();
             let kp = get_f32(args, "kp", 100.0)?;
             let kd = get_f32(args, "kd", 10.0)?;
+            let target_pos = get_f32(args, "pos", 0.0)?;
+            let target_vel = get_f32(args, "vel", 0.0)?;
+            let target_torque = get_torque(args)?;
             let loop_ms = get_u64(args, "loop-ms", 5)?;
+            sigint::install();
+            println!(
+                "starting MIT control for motor 0x{motor_id:02X}: pos={target_pos} vel={target_vel} kp={kp} kd={kd} tau={target_torque} loop={loop_ms}ms"
+            );
+            println!(
+                "  Ctrl+C sends StopMotor (0x63) then exits; pos/vel units follow the last received frame"
+            );
+            let _ = motor.send_start_motor();
+            let mut cycles = 0u64;
 
-            loop {
-                let pos = get_f32(args, "pos", 0.0)?;
-                let vel = get_f32(args, "vel", 0.0)?;
-                let torque = get_f32(args, "torque", 0.0)?;
-                motor.send_mit_command(pos, vel, kp, kd, torque)?;
+            while !sigint::stop_requested() {
+                motor.send_mit_command(target_pos, target_vel, kp, kd, target_torque)?;
                 let _ = ctrl.poll_feedback_once();
                 if let Some(state) = motor.latest_state() {
-                    print!(
-                        "\rpos={:.4} vel={:.4} cur={:.3} err=0x{:X} mode={} temp={:.1}°C",
-                        state.pos,
-                        state.vel,
-                        state.current,
-                        state.error_code,
-                        state.mode_state,
-                        state.motor_temp
-                    );
+                    print!("\r{}", progress_line(&state));
                 }
+                cycles += 1;
                 std::thread::sleep(Duration::from_millis(loop_ms));
             }
+
+            println!("\nstop requested after {cycles} cycles");
+            match motor.send_stop_motor() {
+                Ok(()) => println!("  StopMotor (0x63) sent; the axis returns to IDLE"),
+                Err(err) => eprintln!("  StopMotor failed: {err}"),
+            }
+            ctrl.shutdown()?;
         }
 
         "pos" => {
             let motor = ctrl.add_motor(motor_id, motor_id, model)?;
-            println!("starting POS control for motor 0x{motor_id:02X} (Ctrl+C to stop)...");
-            let _ = motor.send_start_motor();
+            let target_pos = get_f32(args, "pos", 0.0)?;
+            let vel_limit = get_f32(args, "vel-limit", 100.0)?;
+            // Current limit [A]. Default exceeds hardware max so the firmware torque_lim clamp is inert.
+            let cur_limit = get_f32(args, "cur-limit", 200.0)?;
             let loop_ms = get_u64(args, "loop-ms", 10)?;
+            sigint::install();
+            println!(
+                "starting POS control for motor 0x{motor_id:02X}: pos={target_pos} vel_limit={vel_limit} cur_limit={cur_limit} loop={loop_ms}ms"
+            );
+            println!("  Ctrl+C sends StopMotor (0x63) then exits");
+            let _ = motor.send_start_motor();
+            let mut cycles = 0u64;
 
-            loop {
-                let pos = get_f32(args, "pos", 0.0)?;
-                let vel_limit = get_f32(args, "vel-limit", 100.0)?;
-                // Current limit [A]. Default exceeds hardware max so the firmware torque_lim clamp is inert.
-                let cur_limit = get_f32(args, "cur-limit", 200.0)?;
-                motor.send_pos_control(pos, vel_limit, cur_limit)?;
+            while !sigint::stop_requested() {
+                motor.send_pos_control(target_pos, vel_limit, cur_limit)?;
                 let _ = ctrl.poll_feedback_once();
                 if let Some(state) = motor.latest_state() {
-                    print!(
-                        "\rpos={:.4} vel={:.4} err=0x{:X}",
-                        state.pos, state.vel, state.error_code
-                    );
+                    print!("\r{}", progress_line(&state));
                 }
+                cycles += 1;
                 std::thread::sleep(Duration::from_millis(loop_ms));
             }
+
+            println!("\nstop requested after {cycles} cycles");
+            match motor.send_stop_motor() {
+                Ok(()) => println!("  StopMotor (0x63) sent; the axis returns to IDLE"),
+                Err(err) => eprintln!("  StopMotor failed: {err}"),
+            }
+            ctrl.shutdown()?;
         }
 
         "vel" => {
             let motor = ctrl.add_motor(motor_id, motor_id, model)?;
-            println!("starting VEL control for motor 0x{motor_id:02X} (Ctrl+C to stop)...");
-            let _ = motor.send_start_motor();
+            let target_vel = get_f32(args, "vel", 0.0)?;
+            // Current limit [A]. Default exceeds hardware max so the firmware torque_lim clamp is inert.
+            let cur_limit = get_f32(args, "cur-limit", 200.0)?;
             let loop_ms = get_u64(args, "loop-ms", 10)?;
+            sigint::install();
+            println!(
+                "starting VEL control for motor 0x{motor_id:02X}: vel={target_vel} rpm cur_limit={cur_limit} loop={loop_ms}ms"
+            );
+            println!("  Ctrl+C sends StopMotor (0x63) then exits");
+            let _ = motor.send_start_motor();
+            let mut cycles = 0u64;
 
-            loop {
-                let vel_rpm = get_f32(args, "vel", 0.0)?;
-                // Current limit [A]. Default exceeds hardware max so the firmware torque_lim clamp is inert.
-                let cur_limit = get_f32(args, "cur-limit", 200.0)?;
-                motor.send_vel_control(vel_rpm, cur_limit)?;
+            while !sigint::stop_requested() {
+                motor.send_vel_control(target_vel, cur_limit)?;
                 let _ = ctrl.poll_feedback_once();
                 if let Some(state) = motor.latest_state() {
-                    print!(
-                        "\rvel={:.4} cur={:.3} err=0x{:X}",
-                        state.vel, state.current, state.error_code
-                    );
+                    print!("\r{}", progress_line(&state));
                 }
+                cycles += 1;
                 std::thread::sleep(Duration::from_millis(loop_ms));
             }
+
+            println!("\nstop requested after {cycles} cycles");
+            match motor.send_stop_motor() {
+                Ok(()) => println!("  StopMotor (0x63) sent; the axis returns to IDLE"),
+                Err(err) => eprintln!("  StopMotor failed: {err}"),
+            }
+            ctrl.shutdown()?;
         }
 
         "torque" => {
             let motor = ctrl.add_motor(motor_id, motor_id, model)?;
-            println!("starting TORQUE control for motor 0x{motor_id:02X} (Ctrl+C to stop)...");
-            let _ = motor.send_start_motor();
+            let target_torque = get_torque(args)?;
             let loop_ms = get_u64(args, "loop-ms", 5)?;
+            sigint::install();
+            println!(
+                "starting TORQUE control for motor 0x{motor_id:02X}: tau={target_torque} loop={loop_ms}ms"
+            );
+            println!("  Ctrl+C sends StopMotor (0x63) then exits");
+            let _ = motor.send_start_motor();
+            let mut cycles = 0u64;
 
-            loop {
-                let torque_nm = get_f32(args, "torque", 0.0)?;
-                motor.send_torque_control(torque_nm)?;
+            while !sigint::stop_requested() {
+                motor.send_torque_control(target_torque)?;
                 let _ = ctrl.poll_feedback_once();
                 if let Some(state) = motor.latest_state() {
-                    print!(
-                        "\rtorque_target={:.4} cur={:.3} err=0x{:X}",
-                        torque_nm, state.current, state.error_code
-                    );
+                    print!("\r{}", progress_line(&state));
                 }
+                cycles += 1;
                 std::thread::sleep(Duration::from_millis(loop_ms));
             }
+
+            println!("\nstop requested after {cycles} cycles");
+            match motor.send_stop_motor() {
+                Ok(()) => println!("  StopMotor (0x63) sent; the axis returns to IDLE"),
+                Err(err) => eprintln!("  StopMotor failed: {err}"),
+            }
+            ctrl.shutdown()?;
         }
 
         "enable" => {
             let motor = ctrl.add_motor(motor_id, motor_id, model)?;
             motor.send_start_motor()?;
-            println!("enabled motor 0x{motor_id:02X}");
+            println!(
+                "enabled motor 0x{motor_id:02X} (StartMotor 0x62 sent; the device stays enabled after this CLI exits)"
+            );
             ctrl.shutdown()?;
         }
 
         "disable" => {
             let motor = ctrl.add_motor(motor_id, motor_id, model)?;
             motor.send_stop_motor()?;
-            println!("disabled motor 0x{motor_id:02X}");
+            println!("disabled motor 0x{motor_id:02X} (StopMotor 0x63 sent)");
+            ctrl.shutdown()?;
+        }
+
+        "estop" => {
+            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            println!(
+                "warning: sending ESTOP (MsgType 0xC0). 0xC0 is a broadcast-class message type (>= 0x80); this implementation fills dest=0x{motor_id:02X}, but if the firmware treats 0xC0 as broadcast it affects every node on the bus"
+            );
+            motor.send_estop()?;
+            println!("estop (0xC0) sent to 0x{motor_id:02X}");
+            ctrl.shutdown()?;
+        }
+
+        "clear-error" | "clear-fault" => {
+            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            motor.send_clear_errors()?;
+            println!("clear-errors (0x65) sent to 0x{motor_id:02X}; re-read status to verify");
+            ctrl.shutdown()?;
+        }
+
+        "set-zero" => {
+            if !args.contains_key("yes") {
+                return Err(
+                    "set-zero changes the mechanical zero reference; re-run with --yes to confirm"
+                        .into(),
+                );
+            }
+            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            motor.send_set_zero()?;
+            println!(
+                "set-zero (0x61) sent to 0x{motor_id:02X}; re-read status to confirm the new zero"
+            );
+            ctrl.shutdown()?;
+        }
+
+        // Passive link/state monitor: never transmits a frame.
+        "monitor" => {
+            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            let duration_s = get_u64(args, "duration-s", 0)?;
+            sigint::install();
+            println!(
+                "monitor: passive (no frame is transmitted), duration {}",
+                if duration_s == 0 {
+                    "until Ctrl+C".to_string()
+                } else {
+                    format!("{duration_s}s")
+                }
+            );
+            let started = Instant::now();
+            let mut heartbeats = 0u64;
+            let mut lost = 0u64;
+            let mut prev_life: Option<u8> = None;
+            let mut prev_print = Instant::now();
+
+            while !sigint::stop_requested() {
+                if duration_s > 0 && started.elapsed() >= Duration::from_secs(duration_s) {
+                    break;
+                }
+                let _ = ctrl.poll_feedback_once();
+                if let Some(state) = motor.latest_state() {
+                    if state.can_id_parts.msg_type == MsgType::Heartbeat as u8 {
+                        match prev_life {
+                            Some(prev) => {
+                                let delta = state.heartbeat_life.wrapping_sub(prev) & 0x07;
+                                if delta != 0 {
+                                    heartbeats += u64::from(delta);
+                                    lost += u64::from(delta - 1);
+                                    prev_life = Some(state.heartbeat_life);
+                                }
+                            }
+                            None => {
+                                heartbeats += 1;
+                                prev_life = Some(state.heartbeat_life);
+                            }
+                        }
+                    }
+                    if prev_print.elapsed() >= Duration::from_millis(500) {
+                        println!(
+                            "  t={:>6.1}s heartbeats={heartbeats} lost={lost} | {}",
+                            started.elapsed().as_secs_f32(),
+                            progress_line(&state)
+                        );
+                        prev_print = Instant::now();
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+
+            let elapsed = started.elapsed().as_secs_f32();
+            let total = heartbeats + lost;
+            println!(
+                "monitor done: {elapsed:.1}s heartbeats={heartbeats} lost={lost} ({:.2}% loss), rate={:.2} Hz",
+                if total > 0 {
+                    100.0 * lost as f32 / total as f32
+                } else {
+                    0.0
+                },
+                heartbeats as f32 / elapsed.max(0.001)
+            );
+            ctrl.shutdown()?;
+        }
+
+        // Query keep-alive: sends QueryStatus / QueryPosVel only, never enable or control frames.
+        "keep-alive" => {
+            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            let period_ms = get_u64(args, "keep-alive-ms", 500)?;
+            let duration_s = get_u64(args, "duration-s", 0)?;
+            if period_ms == 0 {
+                return Err("--keep-alive-ms must be greater than 0".into());
+            }
+            sigint::install();
+            println!(
+                "keep-alive: QueryStatus + QueryPosVel every {period_ms} ms, duration {}; no StartMotor or control frame is sent",
+                if duration_s == 0 {
+                    "until Ctrl+C".to_string()
+                } else {
+                    format!("{duration_s}s")
+                }
+            );
+            let started = Instant::now();
+            let mut sent = 0u64;
+            let mut next_print = Instant::now();
+
+            while !sigint::stop_requested() {
+                if duration_s > 0 && started.elapsed() >= Duration::from_secs(duration_s) {
+                    break;
+                }
+                motor.send_query_status()?;
+                motor.send_query_pos_vel()?;
+                sent += 2;
+                let deadline = Instant::now() + Duration::from_millis(period_ms);
+                while Instant::now() < deadline {
+                    let _ = ctrl.poll_feedback_once();
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                if next_print.elapsed() >= Duration::from_secs(1) {
+                    match motor.latest_state() {
+                        Some(state) => println!(
+                            "  t={:>6.1}s sent={sent} | {}",
+                            started.elapsed().as_secs_f32(),
+                            progress_line(&state)
+                        ),
+                        None => println!(
+                            "  t={:>6.1}s sent={sent} | no response yet",
+                            started.elapsed().as_secs_f32()
+                        ),
+                    }
+                    next_print = Instant::now();
+                }
+            }
+            println!("keep-alive done: sent={sent} frame(s)");
             ctrl.shutdown()?;
         }
 
         other => {
             eprintln!(
-                "unknown mode: {other}. Supported: scan, status, mit, pos, vel, torque, enable, disable"
+                "unknown mode: {other}. Supported: scan, status, mit, pos, vel, torque, enable, disable, estop, clear-error, set-zero, monitor, keep-alive"
             );
             ctrl.shutdown()?;
         }
