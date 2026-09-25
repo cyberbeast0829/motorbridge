@@ -43,6 +43,36 @@ scripts/canable_restart.sh can0
 
 Then confirm `can0` is `UP`, bitrate is `1000000`, and the driver line matches the adapter.
 
+#### 2.2.1 slcan adapters (vendor USB2CAN, no gs_usb driver)
+
+Some adapters — for example the CyberBeast/MCS `16d0:117e` "CyberBeast USB2CAN" —
+run LAWICEL/slcan firmware over a CDC serial port instead of the gs_usb driver.
+They appear as `/dev/ttyACM*` and are bridged to SocketCAN by `slcand`; afterwards
+the SDK uses the resulting interface name like any other classic-CAN channel.
+
+```bash
+sudo modprobe slcan
+sudo slcand -o -c -s8 /dev/ttyACM0 slcan0   # -s8 = 1 Mbit/s (-s6 = 500k, -s5 = 250k)
+sleep 1
+sudo ip link set slcan0 up
+ip -details -s link show slcan0             # expect link/can, UP, RX/TX errors 0
+candump -t d slcan0                         # frames appear without root
+```
+
+Notes (verified with a CyberBeast node at 1 Mbit/s):
+
+- The device heartbeat arrives at 10.00 Hz with 0 dropped frames, and
+  `RX errors / dropped` stay at 0 on `slcan0`.
+- Only `slcand` and `ip link set up` need root; `candump` and `motor_cli` do not.
+- The adapter's CAN bitrate must match `-sX`. The serial baud rate is irrelevant for
+  USB-CDC adapters (use `-S` only for adapters with a real UART).
+- Cleanup: `sudo pkill slcand` (or `sudo slcand -k slcan0`).
+- slcan carries CAN frames as text lines over USB serial, so treat its throughput
+  as a budget to measure (section 3) before running fast control loops.
+- `slcand` does not verify the adapter protocol: if `slcan0` comes up but `candump`
+  stays silent, check the wiring and bitrate first, then try `cansend slcan0
+  15000404#0000000000000000` (a CyberBeast QUERY_STATUS) and watch for a reply.
+
 ### 2.3 Quick traffic sanity checks
 
 ```bash

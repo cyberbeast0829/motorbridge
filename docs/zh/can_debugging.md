@@ -43,6 +43,32 @@ scripts/canable_restart.sh can0
 
 然后确认 `can0` 为 `UP`，波特率为 `1000000`，并且 driver 行与当前适配器匹配。
 
+#### 2.2.1 slcan 适配器（厂商 USB2CAN，非 gs_usb 驱动）
+
+部分适配器（例如 CyberBeast/MCS 的 `16d0:117e`「CyberBeast USB2CAN」）在 CDC 串口上
+跑 LAWICEL/slcan 固件，而不是 gs_usb 驱动。它们会枚举为 `/dev/ttyACM*`，用 `slcand`
+桥接出 SocketCAN 接口，之后 SDK 与使用普通经典 CAN 通道完全一致，填接口名即可。
+
+```bash
+sudo modprobe slcan
+sudo slcand -o -c -s8 /dev/ttyACM0 slcan0   # -s8 = 1 Mbit/s（-s6 = 500k，-s5 = 250k）
+sleep 1
+sudo ip link set slcan0 up
+ip -details -s link show slcan0             # 期望 link/can、UP、RX/TX errors 为 0
+candump -t d slcan0                         # 普通用户即可看到帧
+```
+
+注意事项（已在 1 Mbit/s 的 CyberBeast 节点上验证）：
+
+- 设备心跳稳定在 10.00 Hz、丢帧 0，`slcan0` 的 `RX errors / dropped` 保持 0。
+- 只有 `slcand` 与 `ip link set up` 需要 root；`candump`、`motor_cli` 不需要。
+- 适配器的 CAN 波特率必须与 `-sX` 一致；USB-CDC 适配器可忽略串口波特率
+  （只有带真实 UART 的适配器才需要 `-S`）。
+- 收尾：`sudo pkill slcand`（或 `sudo slcand -k slcan0`）。
+- slcan 是把 CAN 帧当文本行经 USB 串口传输，吞吐需实测（见第 3 节）后再决定能否跑高速控制环。
+- `slcand` 不校验适配器协议：`slcan0` 起来了但 `candump` 没帧时，先查接线与波特率，
+  再用 `cansend slcan0 15000404#0000000000000000`（CyberBeast 的 QUERY_STATUS）看是否有回帧。
+
 ### 2.3 链路最小自检
 
 ```bash
