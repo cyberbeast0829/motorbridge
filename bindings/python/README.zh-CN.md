@@ -271,15 +271,17 @@ with Controller.from_socketcanfd("can0") as ctrl:
 CyberBeast 快速示例（经典 CAN + ODrive SDO 端点）:
 
 ```python
-from motorbridge import Controller, EP_CONTROLLER_ERROR, Mode
+from motorbridge import Controller, EP_MOTOR_TORQUE_CONSTANT, EP_ODRV_VBUS_VOLTAGE, EP_CONTROLLER_VEL_LIMIT, Mode
 
 with Controller("can0") as ctrl:
     motor = ctrl.add_cyberbeast_motor(0x01, 0x01, "odrive-default")
-    print(motor.cyberbeast_get_param_f32(EP_CONTROLLER_ERROR, 500))
+    # 端点 ID 来自设备自报的 JSON 描述符，不是固定编号
+    print(motor.cyberbeast_get_param_f32(EP_ODRV_VBUS_VOLTAGE, 500))       # 0x0002, float
+    print(motor.cyberbeast_get_param_f32(EP_MOTOR_TORQUE_CONSTANT, 500))   # 0x00F7, float
     ctrl.enable_all()                          # enable = 进入 AXIS_STATE_CLOSED_LOOP
     motor.ensure_mode(Mode.POS_VEL, 1000)      # 校验模式码并启动轴
     motor.send_pos_vel(0.5, 2.0)
-    motor.cyberbeast_write_param_f32(0x0039, 5.0)   # controller.config.vel_limit
+    motor.cyberbeast_write_param_f32(EP_CONTROLLER_VEL_LIMIT, 5.0)  # 0x012D vel_limit (turns/s)
     motor.store_parameters()                   # CONFIG_SAVE
     print(motor.get_state())
     motor.close()

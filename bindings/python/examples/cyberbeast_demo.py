@@ -22,7 +22,11 @@ from motorbridge import Controller, Mode, get_cyberbeast_endpoint
 
 # Endpoints probed by --mode probe; they are documented in
 # motorbridge.cyberbeast_endpoints (mirrors registers.rs REGISTER_TABLE).
-PROBE_ENDPOINTS = (0x0030, 0x0304, 0x0019, 0x0012)
+# Ids come from the device's own JSON descriptor (firmware 0.6.9), and these four
+# are float32 endpoints, which is what cyberbeast_get_param_f32 can read:
+# odrv.vbus_voltage, axis0.motor.config.torque_constant,
+# axis0.controller.config.pos_gain, axis0.motor.config.current_lim.
+PROBE_ENDPOINTS = (0x0002, 0x00F7, 0x0123, 0x00F9)
 
 
 def _parse_id(text: str) -> int:

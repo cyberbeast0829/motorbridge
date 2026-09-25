@@ -1,0 +1,142 @@
+# CyberBeast 协议 v2.4 文档 vs 真机固件：差异与证据
+
+面向对象：CyberBeast / MCS 固件与文档维护者
+整理来源：motorbridge 真机测试（2026-09-25）
+
+---
+
+## 0. 测试环境（可复现）
+
+| 项 | 值 |
+|---|---|
+| 转接器 | `16d0:117e` MCS **CyberBeast USB2CAN**（`iSerial = N32H473-0001`），slcan 固件，`/dev/ttyACM0` |
+| 链路 | Linux SocketCAN（`slcand -o -c -s8`）→ `slcan0`，**1 Mbit/s**，RX errors 0 / dropped 0 |
+| 节点 | 单轴，`axis0.config.can.node_id = 1`，`is_extended = true`（29-bit 扩展帧） |
+| 主站 | `Source = 1`（协议默认 master id） |
+| 固件 | `QUERY_DEVICE_INFO (0x46)` 回 `hw = 0x00040237`（4.2.55）、`fw = 0x00000609`（0.6.9） |
+| 端点描述符 | `JSON_DESC_READ 0x24` + `JSON_DESC_DATA 0x25`：`TotalLength = 38433`，`VersionCRC = 0x3F82`，554 个端点 |
+| 心跳 | `0x19200404`（Priority=6 STATUS、MsgType=0x48、Dest=1、Source=1、Seq=0），**实测 10.00 Hz**，`life` 计数器 0→7 递增 |
+
+> 复核工具：`tools/cb_json_probe.py`（拉取并解析端点描述符）；
+> `motor_cli --vendor cyberbeast --channel slcan0 --motor-id 1 --mode read-param --endpoint <id>`
+> （打印声明的类型 + 原始小端字节）；`--trace` 打印每一帧的 29-bit 位域与载荷。
+
+---
+
+## 1. ⚠ PARAM_READ (0x20) 的 **value 字节序：文档写大端，固件是小端**
+
+**文档 4.7**：
+```
+响应:
+Byte 4..:   [Value]           (DataLen 字节, Big-Endian)
+```
+
+**实测（三条独立证据，均为 `Offset=0, ReqLen=4` 的响应帧）**：
+
+| 端点 | 变量 | 响应原始帧（payload） | 按**小端**解 | 按**大端**解（文档） |
+|---|---|---|---|---|
+| `0x0002` | `odrv.vbus_voltage` | `00 00 02 04 **26 B7 B8 41**` | **23.09 V** ✅ | 4.5e-15 ❌ |
+| `0x00F7` | `axis0.motor.config.torque_constant` | `00 00 F7 04 **AF D9 A8 3D**` | **0.0824 Nm/A** ✅ | 1.5e-14 ❌ |
+| `0x0186` | `axis0.encoder.config.cpr` | `00 01 86 04 **00 40 00 00**` | **16384** ✅ | 4 194 304 ❌ |
+
+（payload 前 4 字节 = `Flags | EndpointID(2B BE) | DataLen`；上表加粗处是 value 4 字节。）
+
+**请求侧**：Offset 字段（`Byte 4-7, uint32`）**大端**解析是可用的——
+对 `serial_number`（uint64）先用 `Offset=0` 拿到 `Flags=0x80 (More), DataLen=4, bytes[0..3] = 50 34 66 0D`，
+再用 `Offset=4` 补齐后 4 字节，拼出的 `uint64` = `108005767394384` 合理；即
+**请求 offset 大端 / 响应 value 小端** 的组合。
+
+**请厂商确认**：响应 value 是否应改为大端（与文档一致），还是文档应更正为小端（与固件一致）？
+SDK 已按**实测小端**实现，并在两个 crate 的注释里写明了该差异。
+
+---
+
+## 2. ⚠ 端点 ID 不是固定编号，必须走 JSON 描述符（文档方向正确，实现提示不足）
+
+**文档 4.7/4.8** 说端点 “兼容 Fibre endpoint 体系”，并提供了 `JSON_DESC_READ 0x24 / JSON_DESC_DATA 0x25`。
+
+**实测**：描述符可用且完整（38433 字节 / 554 端点 / `VersionCRC = 0x3F82`），
+但**端点 ID 与“序数编号”无关**。我们早期按“看起来自然”的编号访问全部失败，对照如下：
+
+| 变量 | 自然编号（❌ 实测无效） | **描述符给出的真实 ID** | 类型 |
+|---|---|---|---|
+| `odrv.error` | — | `0x0001` | uint8 rw |
+| `odrv.vbus_voltage` | — | `0x0002` | float r |
+| `odrv.serial_number` | — | `0x0005` | uint64 r |
+| `axis0.current_state` | `0x0000` | **`0x008E`** | uint8 r |
+| `axis0.requested_state` | `0x0001` | **`0x008F`** | uint8 rw |
+| `axis0.config.watchdog_timeout` | — | `0x0099` | float rw |
+| `axis0.config.enable_watchdog` | — | `0x009A` | bool rw |
+| `axis0.motor.config.torque_constant` | `0x0019` | **`0x00F7`** | float rw |
+| `axis0.motor.config.current_lim` | `0x001C` | **`0x00F9`** | float rw |
+| `axis0.controller.config.control_mode` | `0x0030` | **`0x011F`** | uint8 rw |
+| `axis0.controller.config.pos_gain` | `0x0035` | **`0x0123`** | float rw |
+| `axis0.encoder.config.cpr` | — | `0x0186` | int32 rw |
+
+**请厂商确认**：
+1. 是否有**官方**的“端点 ID ↔ 名称/类型”表可供 SDK 内置（而不是只能运行时从描述符解析）？
+2. 描述符 `VersionCRC` 变化时，主站应如何判断“端点映射已变、需重新拉取”（推荐做法）？
+
+---
+
+## 3. ⚠ MIT 响应帧的 **Current 量程**依赖配置（文档已说明；SDK 默认值待修正）
+
+**文档 4.1.2 备注**：`max_current = mit_max_torque / torque_constant`，钳位上限 80 A；
+`torque_constant` 无效时用默认 ±40 A。
+
+**实测本机**：`mit_max_torque = 50 Nm`（0x0151）、`torque_constant = 0.0824 Nm/A`（0x00F7）
+⇒ `50 / 0.0824 = 606 A` → **钳位到 80 A**，即 MIT 响应的电流分辨率应按 **±80 A** 解读。
+
+**请厂商确认**：钳位值 80 A 是否为固定常量？（若是可配置，请给出读取方式。）
+> SDK 侧：`DEFAULT_MIT_CURRENT_LIMIT = 40`（用于响解）需改为“优先按描述符/端点推导，回退 40”。
+
+---
+
+## 4. ✅ 已与文档**一致**、经真机验证的部分（供交叉确认）
+
+| 项目 | 文档 | 实测 |
+|---|---|---|
+| Classic CAN 心跳 8 字节 | `Life3\|Err5 / State4\|Mode4 / MtrTmp(uint8-50) / Pos int16 BE turns×100 / Vel int16 BE turns/s×100 / Iq int8 0.5A` | ✅ 逐字节吻合（`A0 13 4E …` → life=5、err=0、28 °C、pos=0、vel≈±0.02 turns/s、iq=0） |
+| 心跳周期 | 默认 100 ms（`can.heartbeat_rate_ms`） | ✅ **实测 10.00 Hz**，端点 `axis0.config.can.heartbeat_rate_ms = 100` |
+| CAN ID 布局 | `Priority[28:26]\|MsgType[25:18]\|Dest[17:10]\|Source[9:2]\|Seq[1:0]` | ✅ 用 `(6<<26)\|(0x48<<18)\|(1<<10)\|(1<<2)\|0` 精确复现设备心跳 ID `0x19200404` |
+| MIT 响应 (0x00) | `Pos16 \| Vel12\|Err4 \| Cur12\|Mode4 \| MotorTmp \| MOSTmp` | ✅ 实测 `7FFF7FF080024E50` → pos≈0、vel≈0、err=0、mode=2(IDLE)、28 °C / 30 °C |
+| `ModeState` 枚举 | `0x2 = IDLE` | ✅ 设备 idle 时回 2；且 `axis0.current_state = 1` 与心跳 `byte1` 高半字节 = 1 互相印证 |
+| POS_CONTROL Classic | 输出端**度数** / int16 RPM / int16 0.1A | ✅ 与实现一致（尚未做运动验证） |
+| `QUERY_DEVICE_INFO` Classic | `Byte 0-3 HW uint32 = (MAJOR<<16)\|(MINOR<<8)\|VARIANT`；`Byte 4-7 FW` 同构 | ✅ `hw 4.2.55` / `fw 0.6.9`，与描述符里的 `hw_version_*` / `fw_version_*` 字节一致 |
+| `QUERY_POS_VEL` | float32 BE，**电机端 turns / turns/s** | ✅ 语义一致（SDK 已在 state 层统一换算为 rad，见 §5） |
+| 端点分段读 | ReqLen/Offset + `Flags bit7 = More`；Classic 下 4 字节/块 | ✅ `serial_number` 两次请求拼出 uint64 |
+
+---
+
+## 5. 需要厂商确认的两个“语义边界”（不是 bug，但影响上位机实现）
+
+1. **电机端 vs 输出端**：文档 4.1.1 说明 MIT/POS/VEL 命令为**输出端**单位（固件内部 `× gear_ratio / 2π`），
+   而心跳/`QUERY_POS_VEL` 上报的是**电机端 turns**。SDK 无法从设备读到减速比，
+   因此我们的状态量被明确定义为“**电机端 rad**，不做减速比修正”。
+   请确认：减速比是否有对应端点可读（便于上位机把反馈换算到输出端）？
+
+2. **ESTOP 的 Dest**：文档 4.9 定义 `Priority = 0 (CRITICAL)`、`Dest = 0xFF`（全局广播），
+   并说明收到后进入 IDLE 且**锁存** `ERROR_ESTOP_REQUESTED`。
+   请确认：`Dest` 是否**必须**为 `0xFF`？固件是否会忽略“非 0xFF 的 ESTOP”？
+   （我们已按文档改为 `Priority=0 + Dest=0xFF + MsgType=0xC0`；尚未在真机上触发，因为会锁存故障。）
+
+3. **看门狗**：实测 `enable_watchdog = false`、`watchdog_timeout = 0` ⇒ 该轴当前不会因通信中断而保护。
+   请确认：`watchdog_timeout = 0` 的语义是“禁用”还是“立即超时”？（文档未给出）
+
+---
+
+## 6. 复现实验的最小步骤
+
+```bash
+# 1) 建链路（1 Mbit/s）
+sudo slcand -o -c -s8 /dev/ttyACM0 slcan0 && sudo ip link set slcan0 up
+
+# 2) 拉取端点描述符（554 项，含名称/类型/access）
+python3 tools/cb_json_probe.py slcan0 /tmp/endpoints.json
+
+# 3) 读参数：打印声明类型 + 原始小端字节（可与上位机/odrivetool 对拍）
+motor_cli --vendor cyberbeast --channel slcan0 --motor-id 1 --mode read-param --endpoint 0x0002
+
+# 4) 看原始帧位域（含心跳解码）
+motor_cli --vendor cyberbeast --channel slcan0 --motor-id 1 --mode status --trace
+```

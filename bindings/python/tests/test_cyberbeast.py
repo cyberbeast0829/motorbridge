@@ -198,7 +198,8 @@ def test_cyberbeast_param_helpers_surface_foreign_handle_error(fake_abi) -> None
 _ENTRY_RE = re.compile(
     r"endpoint_id:\s*(0x[0-9A-Fa-f]+),\s*"
     r'variable:\s*"([^"]+)",\s*'
-    r'description:\s*"([^"]+)",',
+    r'description:\s*"([^"]+)",\s*'
+    r'value_type:\s*"([^"]+)",',
     re.S,
 )
 
@@ -208,13 +209,13 @@ def test_endpoint_table_matches_rust_register_table() -> None:
         encoding="utf-8"
     )
     rust_entries = {
-        int(endpoint_id, 16): (variable, description)
-        for endpoint_id, variable, description in _ENTRY_RE.findall(rust)
+        int(endpoint_id, 16): (variable, description, value_type)
+        for endpoint_id, variable, description, value_type in _ENTRY_RE.findall(rust)
     }
     assert rust_entries, "failed to parse REGISTER_TABLE from registers.rs"
 
     python_entries = {
-        endpoint_id: (spec.variable, spec.description)
+        endpoint_id: (spec.variable, spec.description, spec.value_type)
         for endpoint_id, spec in cyberbeast_endpoints.CYBERBEAST_ENDPOINTS.items()
     }
     assert python_entries == rust_entries
@@ -228,7 +229,7 @@ def test_endpoint_names_match_table() -> None:
         endpoint_id = getattr(cyberbeast_endpoints, name)
         assert endpoint_id in table, f"{name} points at unknown endpoint 0x{endpoint_id:04X}"
 
-    assert cyberbeast_endpoints.get_cyberbeast_endpoint(0x0304) is table[0x0304]
+    assert cyberbeast_endpoints.get_cyberbeast_endpoint(0x0153) is table[0x0153]
     assert cyberbeast_endpoints.get_cyberbeast_endpoint(0xFFFF) is None
 
 
