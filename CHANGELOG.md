@@ -16,11 +16,36 @@ Versioning.
     `Motor.cyberbeast_write_param_f32(param_id, value)` for 16-bit ODrive SDO
     endpoints. A write returns only after the device acknowledges it and the CLI
     reads the value back, reporting `requested` / `value` / `verified`.
-  - `motorbridge.cyberbeast_endpoints` documents the common endpoint IDs and
+  - `motorbridge.cyberbeast_endpoints` documents the verified endpoint IDs and
     mirrors `motor_vendors/cyberbeast/src/registers.rs`.
   - Python CLI support: `--vendor cyberbeast` for `run` (all four unified modes,
     `read-param` / `write-param`, `save`, `set-zero`) and `scan`.
   - `bindings/python/examples/cyberbeast_demo.py`.
+
+### Fixed
+
+- CyberBeast fixes found by driving a real node over slcan (1 Mbit/s, fw 0.6.9;
+  evidence in `release_test_notes/cyberbeast_protocol_v2.4_findings.md`):
+  - SDO `PARAM_READ` values are decoded as **little-endian** typed values (the
+    protocol document says big-endian; `vbus_voltage` reads 23.09 V only that way).
+    Endpoints that are not 4-byte float32 no longer report a misleading timeout,
+    and segmented values (`Flags` bit7 More) are read with `Offset += chunk`, so
+    `uint64` endpoints such as `odrv.serial_number` work. `read_param_raw` /
+    `read_param_f32` send the request themselves (previously the caller had to).
+  - `REGISTER_TABLE` and `motorbridge.cyberbeast_endpoints` were rebuilt from the
+    device's own JSON endpoint descriptor (554 endpoints); the previous IDs
+    (`0x0000` = current_state, `0x0019` = torque_constant, ...) never existed on
+    hardware. The Python parity test now also compares the declared value type.
+  - ESTOP is sent as the documented global broadcast (`Priority=0`, `Dest=0xFF`)
+    instead of a priority-1 frame addressed to the node.
+  - `pos`/`vel` are consistently motor-side radians: only the heartbeat path used
+    to convert turns to radians, so the unit changed with the last received frame.
+  - the MIT response current range is derived from the device
+    (`mit_max_torque / torque_constant`, clamped to 80 A) instead of assuming 40 A.
+  - the CLI `scan`/`status` modes are query-only (they no longer send
+    `StartMotor`/`StopMotor`), control loops send `StopMotor` on Ctrl+C, and
+    `estop` / `clear-error` / `set-zero` / `read-param` / `write-param` /
+    `monitor` / `keep-alive` modes plus `--trace` frame dumps were added.
 
 ## [0.4.9] - 2026-07-06
 

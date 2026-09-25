@@ -10,7 +10,7 @@ use motor_core::device::MotorDevice;
 use motor_core::error::{MotorError, Result};
 use motor_core::model::{ModelCatalog, MotorModelSpec, PvTLimits, StaticModelCatalog};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -152,6 +152,27 @@ const DEFAULT_MIT_KP_LIMIT: f32 = 500.0; // max Kp (N·m/rad)
 const DEFAULT_MIT_KD_LIMIT: f32 = 100.0; // max Kd (N·m·s/rad)
 const DEFAULT_MIT_TORQUE_LIMIT: f32 = 18.0; // ±18 N·m
 const DEFAULT_MIT_CURRENT_LIMIT: f32 = 40.0; // ± A (for response decoding)
+
+/// Protocol 4.1.2 clamps the MIT response current range at 80 A.
+const MAX_MIT_CURRENT_RANGE_A: f32 = 80.0;
+
+/// Endpoint ids verified against the device descriptor; see [`crate::registers::REGISTER_TABLE`].
+const ENDPOINT_MIT_MAX_TORQUE: u16 = 0x0151;
+const ENDPOINT_MOTOR_TORQUE_CONSTANT: u16 = 0x00F7;
+
+/// MIT response current range: `mit_max_torque / torque_constant`, clamped to 80 A.
+///
+/// Returns `None` when the device configuration cannot be used (non-finite or
+/// non-positive values); the caller then keeps the documented 40 A default.
+fn mit_current_range_from(mit_max_torque: f32, torque_constant: f32) -> Option<f32> {
+    if !mit_max_torque.is_finite() || !torque_constant.is_finite() {
+        return None;
+    }
+    if mit_max_torque <= 0.0 || torque_constant <= 0.0 {
+        return None;
+    }
+    Some((mit_max_torque / torque_constant).min(MAX_MIT_CURRENT_RANGE_A))
+}
 
 /// Motor-side turns → radians.
 ///
@@ -315,8 +336,12 @@ pub struct CyberBeastMotor {
     mit_kd_limit: f32,
     /// MIT torque limit for encoding (N·m).
     pub mit_torque_limit: f32,
-    /// Current limit for response decoding (A).
-    mit_current_limit: f32,
+    /// Current range used to decode the MIT response current field (A).
+    ///
+    /// Derived from the device (`mit_max_torque / torque_constant`, clamped to
+    /// 80 A) by [`Self::probe_mit_current_range`]; stays at
+    /// [`DEFAULT_MIT_CURRENT_LIMIT`] until that is called or when it fails.
+    mit_current_limit: AtomicU32,
     /// Parameter cache for SDO endpoint read/write operations.
     param_cache: Mutex<ParamCache>,
 }
@@ -345,7 +370,7 @@ impl CyberBeastMotor {
             mit_kp_limit: DEFAULT_MIT_KP_LIMIT,
             mit_kd_limit: DEFAULT_MIT_KD_LIMIT,
             mit_torque_limit: DEFAULT_MIT_TORQUE_LIMIT,
-            mit_current_limit: DEFAULT_MIT_CURRENT_LIMIT,
+            mit_current_limit: AtomicU32::new(DEFAULT_MIT_CURRENT_LIMIT.to_bits()),
             param_cache: Mutex::new(ParamCache::new()),
         })
     }
@@ -704,6 +729,57 @@ impl CyberBeastMotor {
         }
     }
 
+    /// Read a float32 SDO endpoint, sending the request first.
+    pub fn read_param_f32(&self, endpoint_id: u16, timeout: Duration) -> Result<f32> {
+        let bytes = self.read_param_raw(endpoint_id, timeout)?;
+        let raw: [u8; 4] = bytes.as_slice().try_into().map_err(|_| {
+            MotorError::Unsupported(format!(
+                "endpoint 0x{endpoint_id:04X} returned {} byte(s), expected 4 (float32)",
+                bytes.len()
+            ))
+        })?;
+        Ok(f32::from_le_bytes(raw))
+    }
+
+    /// Current range used to decode MIT response current values (A).
+    pub fn mit_current_limit(&self) -> f32 {
+        f32::from_bits(self.mit_current_limit.load(Ordering::Relaxed))
+    }
+
+    /// Override the MIT response current range (A) without probing the device.
+    pub fn set_mit_current_limit(&self, limit_a: f32) {
+        self.mit_current_limit
+            .store(limit_a.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Derive the MIT response current range from the device configuration.
+    ///
+    /// Protocol 4.1.2: the MIT response encodes current over
+    /// `max_current = mit_max_torque / torque_constant`, clamped to 80 A, while
+    /// devices with an invalid torque constant use 40 A. Reads
+    /// `axis0.controller.config.mit_max_torque` (0x0151) and
+    /// `axis0.motor.config.torque_constant` (0x00F7) so `state.current` is scaled by
+    /// the device's real range instead of the fallback default.
+    ///
+    /// Returns the applied range, or an error (keeping the fallback) when the
+    /// endpoints cannot be read or their values are unusable.
+    pub fn probe_mit_current_range(&self, timeout: Duration) -> Result<f32> {
+        let mit_max_torque = self.read_param_f32(ENDPOINT_MIT_MAX_TORQUE, timeout)?;
+        let torque_constant = self.read_param_f32(ENDPOINT_MOTOR_TORQUE_CONSTANT, timeout)?;
+        match mit_current_range_from(mit_max_torque, torque_constant) {
+            Some(range) => {
+                self.set_mit_current_limit(range);
+                Ok(range)
+            }
+            None => {
+                self.set_mit_current_limit(DEFAULT_MIT_CURRENT_LIMIT);
+                Err(MotorError::Unsupported(format!(
+                    "cannot derive the MIT response current range from mit_max_torque={mit_max_torque} Nm and torque_constant={torque_constant} Nm/A; keeping the {DEFAULT_MIT_CURRENT_LIMIT} A fallback"
+                )))
+            }
+        }
+    }
+
     /// Write a parameter value and wait for acknowledgment.
     pub fn set_param_f32(&self, endpoint_id: u16, value: f32) -> Result<()> {
         self.send_param_write(endpoint_id, value)?;
@@ -783,7 +859,7 @@ impl CyberBeastMotor {
                     &frame.data,
                     self.mit_pos_limit,
                     self.mit_vel_limit,
-                    self.mit_current_limit,
+                    self.mit_current_limit(),
                 );
 
                 let mut state = self
@@ -1044,6 +1120,18 @@ impl MotorDevice for CyberBeastMotor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mit_current_range_follows_the_device_formula() {
+        // Observed on hardware: mit_max_torque 50 Nm / torque_constant 0.0824 Nm/A
+        // = 606 A, clamped to the documented 80 A ceiling.
+        assert_eq!(mit_current_range_from(50.0, 0.0824), Some(80.0));
+        assert_eq!(mit_current_range_from(5.0, 0.1), Some(50.0));
+        assert_eq!(mit_current_range_from(5.0, 0.0), None);
+        assert_eq!(mit_current_range_from(0.0, 0.1), None);
+        assert_eq!(mit_current_range_from(f32::NAN, 1.0), None);
+        assert_eq!(mit_current_range_from(1.0, f32::INFINITY), None);
+    }
     use motor_core::bus::{CanBus, CanFrame};
     use motor_core::test_support::MockBus;
     use std::sync::Arc;

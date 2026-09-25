@@ -267,6 +267,14 @@ fn pump(
     }
 }
 
+/// Report (and apply) the device's MIT response current range so telemetry is scaled correctly.
+fn apply_mit_current_range(motor: &CyberBeastMotor, timeout_ms: u64) {
+    match motor.probe_mit_current_range(Duration::from_millis(timeout_ms)) {
+        Ok(range) => println!("  MIT response current range derived from the device: +/-{range} A"),
+        Err(err) => eprintln!("  warning: {err}"),
+    }
+}
+
 /// `--tau` is accepted as an alias of `--torque` for consistency with other vendors.
 fn get_torque(args: &HashMap<String, String>) -> Result<f32, String> {
     if args.contains_key("tau") {
@@ -479,11 +487,18 @@ pub fn run_cyberbeast(
                 ),
                 None => println!("  device-info : no response to QueryDeviceInfo (0x46)"),
             }
+            match motor.probe_mit_current_range(Duration::from_millis(PARAM_TIMEOUT_MS)) {
+                Ok(range) => println!(
+                    "  mit-current : +/-{range} A (MIT response current range derived from the device)"
+                ),
+                Err(err) => println!("  mit-current : {err}"),
+            }
             ctrl.shutdown()?;
         }
 
         "mit" => {
             let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            apply_mit_current_range(&motor, PARAM_TIMEOUT_MS);
             let kp = get_f32(args, "kp", 100.0)?;
             let kd = get_f32(args, "kd", 10.0)?;
             let target_pos = get_f32(args, "pos", 0.0)?;
@@ -520,6 +535,7 @@ pub fn run_cyberbeast(
 
         "pos" => {
             let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            apply_mit_current_range(&motor, PARAM_TIMEOUT_MS);
             let target_pos = get_f32(args, "pos", 0.0)?;
             let vel_limit = get_f32(args, "vel-limit", 100.0)?;
             // Current limit [A]. Default exceeds hardware max so the firmware torque_lim clamp is inert.
@@ -553,6 +569,7 @@ pub fn run_cyberbeast(
 
         "vel" => {
             let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            apply_mit_current_range(&motor, PARAM_TIMEOUT_MS);
             let target_vel = get_f32(args, "vel", 0.0)?;
             // Current limit [A]. Default exceeds hardware max so the firmware torque_lim clamp is inert.
             let cur_limit = get_f32(args, "cur-limit", 200.0)?;
@@ -585,6 +602,7 @@ pub fn run_cyberbeast(
 
         "torque" => {
             let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            apply_mit_current_range(&motor, PARAM_TIMEOUT_MS);
             let target_torque = get_torque(args)?;
             let loop_ms = get_u64(args, "loop-ms", 5)?;
             sigint::install();
