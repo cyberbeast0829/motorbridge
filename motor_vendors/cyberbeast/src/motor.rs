@@ -827,16 +827,14 @@ impl CyberBeastMotor {
             }
 
             // PARAM_WRITE acknowledgment
-            t if t == MsgType::ParamWrite as u8 => {
-                if frame.data.len() >= 3 {
-                    let endpoint_id = ((frame.data[1] as u16) << 8) | (frame.data[2] as u16);
-                    if protocol::is_param_write_ack(&frame.data, endpoint_id) {
-                        let mut cache = self
-                            .param_cache
-                            .lock()
-                            .map_err(|_| MotorError::Io("param cache lock poisoned".into()))?;
-                        cache.record_write_ack(endpoint_id);
-                    }
+            t if t == MsgType::ParamWrite as u8 && frame.data.len() >= 3 => {
+                let endpoint_id = ((frame.data[1] as u16) << 8) | (frame.data[2] as u16);
+                if protocol::is_param_write_ack(&frame.data, endpoint_id) {
+                    let mut cache = self
+                        .param_cache
+                        .lock()
+                        .map_err(|_| MotorError::Io("param cache lock poisoned".into()))?;
+                    cache.record_write_ack(endpoint_id);
                 }
             }
 
