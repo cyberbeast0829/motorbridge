@@ -979,16 +979,25 @@ pub fn encode_json_desc_read(offset: u32) -> [u8; 8] {
     buf
 }
 
-/// Upper bound for a JSON descriptor transfer: the tested firmware sends 38433
-/// bytes. Also used to tell the metadata frame apart from a data frame.
-pub const JSON_DESC_MAX_BYTES: usize = 512 * 1024;
+/// Largest descriptor a transfer can address: a data frame carries its position in a
+/// **u16** `ChunkOffset`, so a longer descriptor would silently wrap.
+///
+/// The tested firmware sends 38433 bytes, and the metadata frame is only accepted
+/// within this range -- which is also what tells it apart from a data frame at offset
+/// 0 (see [`decode_json_desc_meta`]).
+pub const JSON_DESC_MAX_BYTES: usize = u16::MAX as usize;
 
 /// Decode the JSON_DESC metadata frame into `(TotalLength, VersionCRC)`.
 ///
-/// Returns `None` when the frame cannot be metadata. That check is the only way to
-/// tell the metadata frame from a data frame at offset 0, whose first two bytes are
-/// `0x00 0x00` as well: a data frame carries JSON text from byte 2 on, and those four
-/// bytes read as a little-endian `u32` are far larger than any real descriptor.
+/// Returns `None` when the frame cannot be metadata.
+///
+/// Telling metadata from a data frame matters because both can start with
+/// `0x00 0x00`: byte 0-1 of a data frame is the offset, and `0x00 0x00` means
+/// "offset 0". The discriminator is `TotalLength`: bytes 2-5 of a data frame are JSON
+/// text, and JSON never contains a `0x00` byte, so reading them as a little-endian
+/// `u32` gives a value far above [`JSON_DESC_MAX_BYTES`] for any real descriptor.
+/// The length must also be a positive number of bytes, hence the range below.
+///
 /// The device also repeats the metadata frame after every continuation request, so
 /// callers must ignore metadata whenever it appears, not only at the start.
 pub fn decode_json_desc_meta(data: &[u8]) -> Option<(u32, u16)> {
@@ -996,7 +1005,7 @@ pub fn decode_json_desc_meta(data: &[u8]) -> Option<(u32, u16)> {
         return None;
     }
     let total_len = u32::from_le_bytes([data[2], data[3], data[4], data[5]]);
-    if !(64..=JSON_DESC_MAX_BYTES as u32).contains(&total_len) {
+    if !(1..=JSON_DESC_MAX_BYTES as u32).contains(&total_len) {
         return None;
     }
     let version_crc = u16::from_le_bytes([data[6], data[7]]);
@@ -1172,11 +1181,20 @@ mod tests {
         assert_eq!(decode_json_desc_meta(&meta), Some((38433, 0x3F82)));
 
         // A data frame at offset 0 starts with the JSON itself, so it is not metadata.
+        // The descriptor of the tested node is an **array**, so the frame begins with
+        // `[{"`: only checking for `{` would let it through as metadata and report a
+        // baffling "TotalLength must be 1..=65535" instead of "this is a data frame".
         let first_chunk = [0x00, 0x00, b'{', b'"', b'e', b'n', b'd', b'p'];
         assert_eq!(decode_json_desc_meta(&first_chunk), None);
         let chunk = decode_json_desc_chunk(&first_chunk).expect("valid chunk");
         assert_eq!(chunk.offset, 0);
         assert_eq!(chunk.data, b"{\"endp");
+
+        let array_chunk = [0x00, 0x00, b'[', b'{', b'"', b'n', b'a', b'm'];
+        assert_eq!(decode_json_desc_meta(&array_chunk), None);
+        let chunk = decode_json_desc_chunk(&array_chunk).expect("valid chunk");
+        assert_eq!(chunk.offset, 0);
+        assert_eq!(chunk.data, b"[{\"nam");
 
         // Later chunks carry their own little-endian offset.
         let later = [0x2C, 0x01, b'x', b'y', b'z', b'1', b'2', b'3'];
@@ -1186,6 +1204,23 @@ mod tests {
 
         // Too short to be a data frame.
         assert!(decode_json_desc_chunk(&[0x01, 0x02]).is_none());
+    }
+
+    #[test]
+    fn test_decode_json_desc_meta_only_accepts_lengths_a_u16_offset_can_address() {
+        let meta = |total_len: u32| {
+            let mut data = [0u8; 8];
+            data[2..6].copy_from_slice(&total_len.to_le_bytes());
+            data
+        };
+
+        // The largest descriptor a u16 ChunkOffset can address (last byte at 65534).
+        assert_eq!(decode_json_desc_meta(&meta(65535)), Some((65535, 0x0000)));
+        // One byte more and the firmware would wrap its own offset: reject it here so
+        // the failure names the real problem instead of corrupting the table.
+        assert_eq!(decode_json_desc_meta(&meta(65536)), None);
+        // An empty descriptor is not a descriptor.
+        assert_eq!(decode_json_desc_meta(&meta(0)), None);
     }
 
     #[test]

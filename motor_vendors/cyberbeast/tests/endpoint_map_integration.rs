@@ -21,8 +21,8 @@ use std::time::Duration;
 const MOTOR_ID: u16 = 0x01;
 
 /// Descriptor fixture in the device's own shape: nested `members`, a function under
-/// `outputs`, and a `uint64` that needs a segmented read. Its length is above the
-/// 64-byte minimum a metadata frame may declare.
+/// `outputs`, and a `uint64` that needs a segmented read. It is longer than one
+/// 50-frame cycle, so the transfer needs continuation requests.
 const DESCRIPTOR: &str = r#"[{"name":"axis0","id":14,"type":"object","members":[
   {"name":"current_state","id":142,"type":"uint8","access":"r"},
   {"name":"requested_state","id":143,"type":"uint8","access":"rw"},
@@ -88,6 +88,43 @@ fn param_read_frame(endpoint_id: u16, value: &[u8], more: bool) -> CanFrame {
 /// also repeats the metadata frame on every cycle, which the host must ignore.
 const CHUNKS_PER_CYCLE: usize = 50;
 
+/// Faults the emulated node injects, to exercise the host's recovery paths.
+///
+/// Everything here reproduces something seen or documented for the real protocol:
+/// frames do get lost on a slcan adapter, the first request of a session is the one
+/// most likely to be lost, and an interrupted transfer leaves frames in flight that
+/// the next request sees first.
+#[derive(Default)]
+struct Faults {
+    /// `ChunkOffset`s whose data frame is not sent, once each: a frame lost on the bus.
+    drop_once: Mutex<Vec<u16>>,
+    /// `ChunkOffset`s whose data frame is never sent: a chunk the device cannot deliver.
+    drop_always: Mutex<Vec<u16>>,
+    /// `JSON_DESC_READ` requests to ignore: the request never reached the node.
+    drop_requests: Mutex<u32>,
+    /// Frames pushed before the answer to the next request: residue of a transfer that
+    /// was interrupted (a killed or timed-out master).
+    residue: Mutex<Vec<CanFrame>>,
+}
+
+impl Faults {
+    fn drop_chunk_once(self: &Arc<Self>, offset: u16) {
+        self.drop_once.lock().expect("fault lock").push(offset);
+    }
+
+    fn drop_chunk_always(self: &Arc<Self>, offset: u16) {
+        self.drop_always.lock().expect("fault lock").push(offset);
+    }
+
+    fn drop_requests(self: &Arc<Self>, count: u32) {
+        *self.drop_requests.lock().expect("fault lock") = count;
+    }
+
+    fn push_residue(self: &Arc<Self>, frames: impl IntoIterator<Item = CanFrame>) {
+        self.residue.lock().expect("fault lock").extend(frames);
+    }
+}
+
 /// Emulates the node: it answers **requests** instead of dumping frames, like the
 /// firmware does. `JSON_DESC_READ` is answered with metadata plus up to
 /// [`CHUNKS_PER_CYCLE`] data frames from the requested offset, and `PARAM_READ` with
@@ -98,11 +135,12 @@ struct MockDevice {
 }
 
 impl MockDevice {
-    fn start(
+    fn start_with_faults(
         mock: Arc<MockBus>,
         descriptor: &'static str,
         version_crc: u16,
         params: Arc<Mutex<HashMap<u16, Vec<u8>>>>,
+        faults: Arc<Faults>,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
@@ -117,6 +155,28 @@ impl MockDevice {
                 for request in requests {
                     match can_id_parts(request.arbitration_id).msg_type {
                         t if t == MsgType::JsonDescRead as u8 => {
+                            // One lock scope per decision: `std::sync::Mutex` is not
+                            // reentrant, and a guard held across a second `lock()` would
+                            // deadlock this thread (and hang the test).
+                            let request_lost = {
+                                let mut remaining =
+                                    faults.drop_requests.lock().expect("fault lock");
+                                if *remaining > 0 {
+                                    *remaining -= 1;
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if request_lost {
+                                continue;
+                            }
+                            // Residue of an interrupted transfer is delivered *before*
+                            // the answer to this request, exactly as an adapter that
+                            // still holds frames from the previous run would.
+                            for stale in faults.residue.lock().expect("fault lock").drain(..) {
+                                mock.push_rx(stale);
+                            }
                             // Protocol 4.8: the descriptor offset is little-endian
                             // (unlike PARAM_READ's big-endian offset below).
                             let offset = u32::from_le_bytes([
@@ -131,7 +191,22 @@ impl MockDevice {
                             for (index, chunk) in
                                 bytes[start..].chunks(6).take(CHUNKS_PER_CYCLE).enumerate()
                             {
-                                mock.push_rx(chunk_frame((start + index * 6) as u16, chunk));
+                                let offset = (start + index * 6) as u16;
+                                let lost_once = {
+                                    let mut drop = faults.drop_once.lock().expect("fault lock");
+                                    let position = drop.iter().position(|it| *it == offset);
+                                    position.map(|index| drop.remove(index)).is_some()
+                                };
+                                if lost_once
+                                    || faults
+                                        .drop_always
+                                        .lock()
+                                        .expect("fault lock")
+                                        .contains(&offset)
+                                {
+                                    continue;
+                                }
+                                mock.push_rx(chunk_frame(offset, chunk));
                             }
                         }
                         t if t == MsgType::ParamRead as u8 => {
@@ -243,7 +318,12 @@ struct TestRig {
 
 impl TestRig {
     fn start() -> Self {
-        let rig = Self::start_with_missing_mit_ranges();
+        Self::start_with_faults(Arc::new(Faults::default()))
+    }
+
+    /// A node with a fault plan: lost frames, lost requests, leftover frames.
+    fn start_with_faults(faults: Arc<Faults>) -> Self {
+        let rig = Self::start_with_missing_mit_ranges_and_faults(faults);
         for (endpoint_id, value) in MIT_RANGE_PARAMS {
             rig.set_param(endpoint_id, &value.to_le_bytes());
         }
@@ -255,9 +335,19 @@ impl TestRig {
     /// A node that does not declare its MIT maxima: the connection still works and the
     /// protocol defaults stay in force, with the reason recorded on the handle.
     fn start_with_missing_mit_ranges() -> Self {
+        Self::start_with_missing_mit_ranges_and_faults(Arc::new(Faults::default()))
+    }
+
+    fn start_with_missing_mit_ranges_and_faults(faults: Arc<Faults>) -> Self {
         let (mock, bus) = shared_bus();
         let params: Arc<Mutex<HashMap<u16, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
-        let device = MockDevice::start(Arc::clone(&mock), DESCRIPTOR, 0x3F82, Arc::clone(&params));
+        let device = MockDevice::start_with_faults(
+            Arc::clone(&mock),
+            DESCRIPTOR,
+            0x3F82,
+            Arc::clone(&params),
+            faults,
+        );
         let ctrl = Arc::new(CyberBeastController::new(bus));
         let poller = Poller::start(Arc::clone(&ctrl));
         Self {
@@ -642,4 +732,126 @@ fn reading_without_a_loaded_map_is_reported_honestly() {
         message.contains("endpoint map of this motor is not loaded"),
         "{message}"
     );
+}
+
+#[test]
+fn a_frame_lost_inside_the_descriptor_is_re_fetched() {
+    // One data frame never makes it onto the bus: the chunk at offset 6, right after the
+    // metadata frame -- the position of the first frame of a burst, which is the one a
+    // slcan adapter drops most often. The transfer must notice the hole, ask for the
+    // first missing byte instead of carrying on past it, and still deliver the exact
+    // descriptor text.
+    let faults = Arc::new(Faults::default());
+    faults.drop_chunk_once(6);
+    let rig = TestRig::start_with_faults(Arc::clone(&faults));
+
+    let motor = rig.connect();
+
+    let map = motor.endpoint_map().expect("the map survives a lost frame");
+    assert_eq!(
+        map.json_text(),
+        DESCRIPTOR,
+        "every byte must come from the device, with no padding where the frame was lost"
+    );
+    assert_eq!(map.total_len(), DESCRIPTOR.len() as u32);
+    assert_eq!(map.version_crc(), 0x3F82);
+    assert_eq!(map.len(), 15);
+
+    // The bytes that were streamed past the hole are re-sent, which costs exactly the
+    // one additional request: asking for the first missing byte restarts the device
+    // there (protocol 4.8).
+    let baseline = DESCRIPTOR.len().div_ceil(6 * CHUNKS_PER_CYCLE);
+    assert_eq!(descriptor_requests(&rig.mock), baseline + 1);
+
+    rig.stop();
+}
+
+#[test]
+fn a_chunk_the_device_never_sends_fails_with_the_byte_it_stopped_at() {
+    // A chunk that is lost forever (or a device that cannot deliver it) must not turn
+    // into a descriptor with padding in it, and must not spin for 64 requests either:
+    // the error has to say where the transfer stopped.
+    let faults = Arc::new(Faults::default());
+    faults.drop_chunk_always(6);
+    let rig = TestRig::start_with_faults(Arc::clone(&faults));
+
+    let started = std::time::Instant::now();
+    let message = match rig.ctrl.add_motor(MOTOR_ID, MOTOR_ID, "odrive-default") {
+        Ok(_) => panic!("an incomplete descriptor must not produce a handle"),
+        Err(err) => err.to_string(),
+    };
+    let elapsed = started.elapsed();
+
+    assert!(
+        message.contains("loading the endpoint descriptor from node 0x01"),
+        "{message}"
+    );
+    assert!(message.contains("stalled at byte 6 of"), "{message}");
+    assert!(message.contains("brought nothing new"), "{message}");
+    assert!(
+        !message.contains("not valid JSON"),
+        "the transfer must fail before anyone tries to parse it: {message}"
+    );
+    assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+
+    rig.stop();
+}
+
+#[test]
+fn a_lost_first_request_is_repeated_until_the_transfer_starts() {
+    // The first frame a session sends can be lost while the adapter configures itself,
+    // and adding a motor sends JSON_DESC_READ first. Repeating it is free (the device
+    // restarts the transfer), so connecting must not depend on that frame surviving.
+    let faults = Arc::new(Faults::default());
+    faults.drop_requests(1);
+    let rig = TestRig::start_with_faults(Arc::clone(&faults));
+
+    let motor = rig.connect();
+
+    let map = motor.endpoint_map().expect("the retry loads the map");
+    assert_eq!(map.json_text(), DESCRIPTOR);
+    let baseline = DESCRIPTOR.len().div_ceil(6 * CHUNKS_PER_CYCLE);
+    assert_eq!(descriptor_requests(&rig.mock), baseline + 1);
+
+    rig.stop();
+}
+
+#[test]
+fn residue_from_an_interrupted_transfer_restarts_the_transfer() {
+    // A master that dies mid-transfer leaves frames in the adapter, and they are
+    // delivered *before* the answer to the next request. Here the residue even carries a
+    // metadata frame of another descriptor version, so the host cannot tell which
+    // transfer the bytes belong to. It must throw the assembly away, ask again, and end
+    // up with the device's real table -- never with a mixture.
+    let faults = Arc::new(Faults::default());
+    faults.push_residue([
+        // Metadata of an earlier version: a different TotalLength and crc.
+        {
+            let mut data = [0u8; 8];
+            data[2..6].copy_from_slice(&4567u32.to_le_bytes());
+            data[6..8].copy_from_slice(&0x1234u16.to_le_bytes());
+            frame(MsgType::JsonDescData, data, 8)
+        },
+        // A data frame of that earlier transfer, at offset 0 and at a later offset.
+        chunk_frame(0, b"ZZZZZZ"),
+        chunk_frame(744, b"QQQQQQ"),
+    ]);
+    let rig = TestRig::start_with_faults(Arc::clone(&faults));
+
+    let motor = rig.connect();
+
+    let map = motor.endpoint_map().expect("a restart clears the residue");
+    assert_eq!(
+        map.json_text(),
+        DESCRIPTOR,
+        "no stale byte may survive into the table"
+    );
+    assert_eq!(map.total_len(), DESCRIPTOR.len() as u32);
+    assert_eq!(map.version_crc(), 0x3F82);
+
+    // One extra request: the restarted transfer.
+    let baseline = DESCRIPTOR.len().div_ceil(6 * CHUNKS_PER_CYCLE);
+    assert_eq!(descriptor_requests(&rig.mock), baseline + 1);
+
+    rig.stop();
 }

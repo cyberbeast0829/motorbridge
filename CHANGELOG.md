@@ -79,6 +79,25 @@ Versioning.
   - the JSON descriptor transfer ignores repeated metadata frames and requests the
     next chunk only after the device stops streaming, which is what makes
     `--mode endpoint-map` produce the same bytes as the independent probe.
+  - the descriptor transfer no longer corrupts the table when a frame is lost on the
+    way (protocol 4.8 has no per-chunk integrity, so this has to be handled when
+    reassembling). It used to store every chunk at its own `ChunkOffset`, **zero fill**
+    the gap it had not seen, and then ask for the *end* of the last chunk received --
+    so the hole was never asked for again and the assembled text contained a run of
+    `0x00` (valid UTF-8, invalid JSON: `control character (\u0000-\u001F)`), which made
+    roughly one connect in ten fail. The assembly now keeps only the contiguous run
+    from offset 0, so `bytes.len()` *is* the first missing byte; frames that do not
+    extend that run are dropped (stale residue of an interrupted transfer, repeats,
+    chunks beyond a hole) and the next request asks for the missing byte, which makes
+    the device re-send from there. A transfer that cannot complete is reported with the
+    byte it stopped at instead of being parsed; a second, disagreeing metadata frame
+    restarts the transfer (bounded); and a `TotalLength` above 65535 -- the width of
+    `ChunkOffset` -- is refused. The first request is also repeated a few times on a
+    shorter window, because the first frame after a CAN adapter is opened can be lost,
+    which used to make the first connect of a session fail for no visible reason
+    (evidence: `release_test_notes/cyberbeast_protocol_v2.4_findings.md` section 4.1.1;
+    a second master jumping the transfer mid-stream fails it 4/4 before the fix and 4/4
+    after it, and 21 hardware connects in a row each needed one descriptor request).
   - reading the same endpoint twice returned the previous answer from the cache for
     up to the response timeout (the C ABI and therefore Python were affected: a
     second `cyberbeast_get_param_f32` could report a stale value). A fresh read now

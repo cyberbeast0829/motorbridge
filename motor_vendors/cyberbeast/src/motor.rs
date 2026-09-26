@@ -143,49 +143,147 @@ impl ParamCache {
     }
 }
 
+/// What one `JSON_DESC_DATA` (0x25) frame contributed to the transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DescFrame {
+    /// The metadata frame of the transfer (the device repeats it every cycle).
+    Metadata,
+    /// Descriptor bytes were appended to the end of the contiguous run.
+    Appended,
+    /// The frame carried no usable bytes: residue from an earlier transfer, a repeat
+    /// of bytes already assembled, or a chunk that arrived beyond a hole.
+    Skipped,
+    /// The frame contradicts what was already assembled; the reason is kept in the
+    /// cache's `conflict` field.
+    Conflict,
+}
+
 /// Accumulates a JSON endpoint descriptor transfer (protocol 4.8).
+///
+/// `bytes` always holds the **contiguous** run of descriptor bytes from offset 0, so
+/// `bytes.len()` is exactly the offset the transfer still needs. That invariant is the
+/// whole point: an earlier version stored every chunk at its own `ChunkOffset` and zero
+/// filled anything it had not seen, so a single lost frame left a run of `0x00` inside
+/// the descriptor -- still valid UTF-8, so it surfaced only as a JSON parse error
+/// ("control character") -- and, worse, the continuation request then asked for
+/// `bytes.len()`, the *end* of the last chunk received, which skipped the hole for good.
+///
+/// Frames that do not extend the run are therefore dropped instead of stored: stale
+/// frames from an interrupted transfer, duplicates, and chunks beyond a hole. Nothing is
+/// lost by dropping them, because a `JSON_DESC_READ` at the missing offset makes the
+/// device restart the transfer exactly there (protocol 4.8).
 #[derive(Debug, Default)]
 struct JsonDescCache {
     /// `TotalLength` from the metadata frame, once seen.
     total_len: Option<u32>,
     /// `VersionCRC` from the metadata frame, once seen.
     version_crc: Option<u16>,
-    /// Descriptor bytes assembled so far, positioned by `ChunkOffset`.
+    /// Descriptor bytes assembled so far; contiguous from offset 0, never padded.
     bytes: Vec<u8>,
+    /// Frames that arrived before the metadata frame (residue of an earlier transfer:
+    /// protocol 4.8 only sends data after the metadata frame).
+    before_meta: u32,
+    /// Frames that could not extend `bytes`.
+    skipped: u32,
+    /// Frames that sat beyond a hole: the device streams past a lost chunk.
+    orphans: u32,
+    /// Frames that repeated bytes already assembled (the device restarts a burst at the
+    /// offset that was requested).
+    duplicates: u32,
+    /// Why the transfer is inconsistent, when it is.
+    conflict: Option<String>,
 }
 
 impl JsonDescCache {
     /// Start a new transfer.
     fn reset(&mut self) {
-        self.total_len = None;
-        self.version_crc = None;
-        self.bytes.clear();
+        *self = Self::default();
     }
 
-    /// Record one response frame; returns `true` when the frame was consumed.
-    ///
-    /// The device repeats the metadata frame after every continuation request, so
-    /// metadata is filtered out at any point instead of only at the beginning.
-    fn record(&mut self, data: &[u8]) -> bool {
+    /// Record one response frame; returns what the frame contributed.
+    #[must_use]
+    fn record(&mut self, data: &[u8]) -> DescFrame {
         if let Some((total_len, version_crc)) = protocol::decode_json_desc_meta(data) {
-            if self.total_len.is_none() {
-                self.total_len = Some(total_len);
-                self.version_crc = Some(version_crc);
-            }
-            return true;
+            return match self.total_len {
+                None => {
+                    self.total_len = Some(total_len);
+                    self.version_crc = Some(version_crc);
+                    DescFrame::Metadata
+                }
+                // The device repeats this frame after every continuation request.
+                Some(known) if known == total_len => DescFrame::Metadata,
+                // Two disagreeing metadata frames mean two descriptor versions are on
+                // the wire, which is what an interrupted transfer leaves behind. Guessing
+                // which one is current would hand out a table that belongs to neither, so
+                // the caller restarts (or, if that keeps failing, reports this).
+                Some(known) => {
+                    if self.conflict.is_none() {
+                        self.conflict = Some(format!(
+                            "two different metadata frames in one descriptor transfer: \
+                             TotalLength {known} (VersionCRC 0x{:04X}) and then {total_len} \
+                             (VersionCRC 0x{version_crc:04X}) -- a stale stream from an \
+                             earlier transfer is mixed in",
+                            self.version_crc.unwrap_or(0)
+                        ));
+                    }
+                    DescFrame::Conflict
+                }
+            };
         }
-        let Some(chunk) = protocol::decode_json_desc_chunk(data) else {
-            return false;
+
+        let Some(total_len) = self.total_len else {
+            // Protocol 4.8 sends the metadata frame first, so anything before it is
+            // residue. It must not be stored: its offsets belong to another transfer.
+            self.before_meta += 1;
+            return DescFrame::Skipped;
         };
-        let start = chunk.offset as usize;
-        if start + chunk.data.len() > protocol::JSON_DESC_MAX_BYTES {
-            return false;
+        let Some(chunk) = protocol::decode_json_desc_chunk(data) else {
+            self.skipped += 1;
+            return DescFrame::Skipped;
+        };
+
+        let total_len = total_len as usize;
+        let offset = chunk.offset as usize;
+        if offset >= total_len {
+            // Beyond the descriptor: a stale chunk, or a frame the device padded.
+            self.skipped += 1;
+            return DescFrame::Skipped;
         }
-        if self.bytes.len() < start + chunk.data.len() {
-            self.bytes.resize(start + chunk.data.len(), 0);
+        // The last frame of a transfer is padded out to the frame size, so never take
+        // more bytes than `TotalLength` still has room for.
+        let data = &chunk.data[..chunk.data.len().min(total_len - offset)];
+
+        let expected = self.bytes.len();
+        if offset > expected {
+            // A hole: the chunk before this one never arrived. Keep it out of the buffer
+            // (padding here is what used to corrupt the descriptor) and let the caller
+            // ask for `expected`, the first byte that is missing.
+            self.orphans += 1;
+            return DescFrame::Skipped;
         }
-        self.bytes[start..start + chunk.data.len()].copy_from_slice(chunk.data);
-        true
+
+        // Everything from here on repeats `repeat` bytes and may add new ones.
+        let repeat = (expected - offset).min(data.len());
+        if self.bytes[offset..offset + repeat] != data[..repeat] {
+            if self.conflict.is_none() {
+                self.conflict = Some(format!(
+                    "descriptor bytes at offset {offset} changed during the transfer \
+                     ({} byte(s) assembled so far, and the device repeated different \
+                     content there) -- a stale stream is mixed in",
+                    expected
+                ));
+            }
+            return DescFrame::Conflict;
+        }
+        if offset < expected {
+            self.duplicates += 1;
+        }
+        let fresh = &data[repeat..];
+        if fresh.is_empty() {
+            return DescFrame::Skipped;
+        }
+        self.bytes.extend_from_slice(fresh);
+        DescFrame::Appended
     }
 }
 
@@ -249,7 +347,41 @@ const ENDPOINT_MIT_MAX_TORQUE: u16 = 0x0151;
 const ENDPOINT_MOTOR_TORQUE_CONSTANT: u16 = 0x00F7;
 
 /// Upper bound on continuation requests for one descriptor transfer.
+///
+/// Only reached when frames are being lost: the device streams the whole descriptor in
+/// one go (protocol 4.8 caps it at 50 frames per cycle, not at 50 frames per request), so
+/// a healthy transfer needs exactly one request -- the one that starts it.
 const MAX_JSON_DESC_REQUESTS: u32 = 64;
+
+/// Continuation requests asking for the same offset without any new byte in between,
+/// before the transfer is declared stuck.
+///
+/// A lost chunk is recovered by re-sending `JSON_DESC_READ` at that offset, and the frame
+/// usually turns up on the first or second try. Asking a third time and getting nothing
+/// back means the device cannot deliver that chunk, and waiting on is pointless.
+const MAX_JSON_DESC_STUCK_ATTEMPTS: u32 = 3;
+
+/// Requests sent while no metadata frame has arrived yet.
+///
+/// The very first frame after a CAN adapter is opened can be lost (its controller is
+/// still being configured), and `JSON_DESC_READ` is the first frame this stack sends when
+/// a motor is added -- measured on slcan/CANable, and the same symptom the sibling C SDK
+/// (JoinSDK) fixed by repeating the request. Repeats are free: the device restarts the
+/// transfer at the requested offset.
+const MAX_JSON_DESC_START_ATTEMPTS: u32 = 4;
+
+/// Quiet window used while waiting for the metadata frame.
+///
+/// Shorter than the caller's window on purpose: a device that is going to answer does so
+/// within milliseconds, so this decides how fast a *lost* first request is retried. A
+/// wrong node id therefore still fails in about a second, not in tens of seconds.
+const DESC_START_QUIET_WINDOW: Duration = Duration::from_millis(250);
+
+/// Transfers restarted because the stream mixed two descriptor versions.
+///
+/// Residue from an interrupted transfer is delivered before the answer to the request
+/// that follows it, so a single restart is normally enough to get a clean stream.
+const MAX_JSON_DESC_RESTARTS: u32 = 2;
 
 /// Timeout for each MIT-range read when a motor is connected.
 ///
@@ -923,10 +1055,23 @@ impl CyberBeastMotor {
     /// Fetch the device's JSON endpoint descriptor as raw bytes.
     ///
     /// Sends `JSON_DESC_READ` (0x24) and reassembles the `JSON_DESC_DATA` (0x25)
-    /// frames: one metadata frame plus chunks of 6 JSON bytes. The device streams a
-    /// large burst for a single request, so a continuation request is only sent once
-    /// the device has gone quiet for `timeout` and the descriptor is still incomplete.
-    /// `timeout` therefore bounds the quiet window, not the whole transfer.
+    /// frames: one metadata frame plus chunks of 6 JSON bytes. The device streams its
+    /// own burst for a single request, so `timeout` bounds the quiet window between
+    /// bursts, not the whole transfer.
+    ///
+    /// Both recovery paths below rely on one documented property: repeating
+    /// `JSON_DESC_READ` makes the device restart the transfer **at the requested
+    /// offset** (protocol 4.8), so a repeat never costs more than the bytes it re-sends.
+    ///
+    /// * A frame lost inside the burst leaves the assembled run short. The next request
+    ///   then asks for the first missing byte, so the hole is filled instead of being
+    ///   skipped -- see `JsonDescCache` for what that used to do.
+    /// * The first request of a session can be lost while the adapter finishes
+    ///   configuring itself, so it is repeated a few times on a shorter quiet window
+    ///   until a metadata frame shows that the transfer has started.
+    ///
+    /// The returned bytes are always exactly `TotalLength` long: an incomplete transfer
+    /// is an error, never a short or padded buffer.
     pub fn read_endpoint_descriptor_raw(&self, timeout: Duration) -> Result<(u32, u16, Vec<u8>)> {
         {
             let mut cache = self
@@ -937,45 +1082,122 @@ impl CyberBeastMotor {
         }
         self.send_json_desc_read(0)?;
 
-        let mut last_received = 0usize;
-        let mut quiet_deadline = Instant::now() + timeout;
+        let mut quiet = timeout.min(DESC_START_QUIET_WINDOW);
+        let mut quiet_deadline = Instant::now() + quiet;
+        let mut attempts = 1u32;
         let mut requests = 1u32;
+        let mut restarts = 0u32;
+        let mut stuck = 0u32;
+        // Bytes assembled when the last look at the transfer happened: any growth keeps
+        // the quiet window open.
+        let mut last_received = 0usize;
+        // Buffer length when the last request went out, i.e. the offset it asked for. A
+        // request that leaves the length unchanged did not help.
+        let mut asked_at = 0usize;
+
         loop {
-            let (received, total_len) = {
+            let (received, total_len, conflict, orphans, before_meta) = {
                 let cache = self
                     .json_desc
                     .lock()
                     .map_err(|_| MotorError::Io("json descriptor lock poisoned".into()))?;
-                (cache.bytes.len(), cache.total_len)
+                (
+                    cache.bytes.len(),
+                    cache.total_len,
+                    cache.conflict.clone(),
+                    cache.orphans,
+                    cache.before_meta,
+                )
             };
+
+            if let Some(conflict) = conflict {
+                // Two descriptor versions on the wire: throw the assembly away and ask
+                // again for a stream of its own. Residue is delivered before the answer
+                // to the following request, so a restart normally clears it up.
+                if restarts >= MAX_JSON_DESC_RESTARTS {
+                    return Err(MotorError::Protocol(conflict));
+                }
+                restarts += 1;
+                {
+                    let mut cache = self
+                        .json_desc
+                        .lock()
+                        .map_err(|_| MotorError::Io("json descriptor lock poisoned".into()))?;
+                    cache.reset();
+                }
+                self.send_json_desc_read(0)?;
+                attempts = 1;
+                requests = 1;
+                stuck = 0;
+                asked_at = 0;
+                quiet = timeout.min(DESC_START_QUIET_WINDOW);
+                quiet_deadline = Instant::now() + quiet;
+                continue;
+            }
+
+            let mut done = false;
             if let Some(total_len) = total_len {
                 if received >= total_len as usize {
-                    break;
+                    done = true;
                 }
+                // The transfer is under way: from here on the caller's quiet window
+                // applies, because the device is streaming and may pause between bursts.
+                quiet = timeout;
             }
+
             if received > last_received {
                 // Still streaming: keep the window open.
                 last_received = received;
-                quiet_deadline = Instant::now() + timeout;
+                quiet_deadline = Instant::now() + quiet;
+                stuck = 0;
             } else if Instant::now() > quiet_deadline {
-                if total_len.is_none() {
-                    // Nothing at all came back: stop instead of retrying 64 times,
-                    // which would turn a wrong node id into a ~30 s stall.
-                    return Err(MotorError::Timeout(format!(
-                        "no JSON descriptor metadata from node 0x{:02X} within {timeout:?} \
-                         (wrong node id, silent node, or no access to the endpoint map?)",
-                        self.motor_id
-                    )));
+                let same_offset_again = received == asked_at;
+                match total_len {
+                    None => {
+                        // Nothing came back at all. The first frame of a session is the
+                        // one most likely to be lost, so ask again before giving up on
+                        // the node -- but do give up: a wrong node id must not turn into
+                        // a stall of tens of seconds.
+                        if attempts >= MAX_JSON_DESC_START_ATTEMPTS {
+                            return Err(MotorError::Timeout(format!(
+                                "no JSON descriptor metadata from node 0x{:02X} after \
+                                 {attempts} requests with a {quiet:?} quiet window \
+                                 (wrong node id, silent node, or no access to the endpoint map?)",
+                                self.motor_id
+                            )));
+                        }
+                        attempts += 1;
+                        self.send_json_desc_read(0)?;
+                    }
+                    Some(total_len) => {
+                        // Two requests in a row at the same offset with nothing new in
+                        // between is what "stuck" means.
+                        stuck = if same_offset_again { stuck + 1 } else { 0 };
+                        if stuck >= MAX_JSON_DESC_STUCK_ATTEMPTS
+                            || requests >= MAX_JSON_DESC_REQUESTS
+                        {
+                            return Err(MotorError::Timeout(format!(
+                                "endpoint descriptor transfer from node 0x{:02X} stalled at byte \
+                                 {received} of {total_len}: {stuck} request(s) for that offset \
+                                 brought nothing new ({requests} request(s) in total, {orphans} \
+                                 frame(s) arrived beyond the gap, {before_meta} stale frame(s) \
+                                 before the transfer started)",
+                                self.motor_id
+                            )));
+                        }
+                        requests += 1;
+                        // The first missing byte, **not** the end of the last chunk
+                        // received: the device restarts at this offset, so anything it
+                        // streams past a hole is simply re-sent.
+                        self.send_json_desc_read(received as u32)?;
+                    }
                 }
-                if requests >= MAX_JSON_DESC_REQUESTS {
-                    return Err(MotorError::Timeout(format!(
-                        "endpoint descriptor transfer gave up after {requests} requests ({received} of {} bytes)",
-                        total_len.unwrap_or(0)
-                    )));
-                }
-                requests += 1;
-                self.send_json_desc_read(received as u32)?;
-                quiet_deadline = Instant::now() + timeout;
+                asked_at = received;
+                quiet_deadline = Instant::now() + quiet;
+            }
+
+            if done {
+                break;
             }
             std::thread::sleep(Duration::from_millis(PARAM_POLL_INTERVAL_MS));
         }
@@ -991,7 +1213,15 @@ impl CyberBeastMotor {
                 cache.bytes.clone(),
             )
         };
-        let bytes = bytes[..total_len as usize].to_vec();
+        if bytes.len() != total_len as usize {
+            // The loop only finishes on an exact length; this guards the promise that an
+            // incomplete transfer is an error rather than a buffer with holes in it.
+            return Err(MotorError::Protocol(format!(
+                "endpoint descriptor from node 0x{:02X} is incomplete: {} of {total_len} byte(s)",
+                self.motor_id,
+                bytes.len()
+            )));
+        }
         Ok((total_len, version_crc, bytes))
     }
 
@@ -1616,7 +1846,9 @@ impl CyberBeastMotor {
                     .json_desc
                     .lock()
                     .map_err(|_| MotorError::Io("json descriptor lock poisoned".into()))?;
-                cache.record(&frame.data);
+                // The outcome is counted inside the cache and the fetch loop reads it
+                // back; nothing to do with it here.
+                let _ = cache.record(&frame.data);
             }
 
             _ => {
@@ -1724,19 +1956,172 @@ mod tests {
         let mut cache = JsonDescCache::default();
         cache.reset();
         let meta = [0x00, 0x00, 0x21, 0x96, 0x00, 0x00, 0x82, 0x3F];
-        assert!(cache.record(&meta));
+        assert_eq!(cache.record(&meta), DescFrame::Metadata);
         assert_eq!(cache.total_len, Some(38433));
         assert_eq!(cache.version_crc, Some(0x3F82));
 
-        assert!(cache.record(&[0x00, 0x00, b'{', b'"', b'a', b'b', b'c', b'd']));
-        assert!(cache.record(&[0x06, 0x00, b'e', b'f', b'g', b'h', b'i', b'j']));
+        assert_eq!(
+            cache.record(&[0x00, 0x00, b'{', b'"', b'a', b'b', b'c', b'd']),
+            DescFrame::Appended
+        );
+        assert_eq!(
+            cache.record(&[0x06, 0x00, b'e', b'f', b'g', b'h', b'i', b'j']),
+            DescFrame::Appended
+        );
         assert_eq!(&cache.bytes, b"{\"abcdefghij");
 
         // The device repeats the metadata frame after a continuation request; it
         // must never be stored as descriptor bytes (that would overwrite the start).
-        assert!(cache.record(&meta));
+        assert_eq!(cache.record(&meta), DescFrame::Metadata);
         assert_eq!(&cache.bytes, b"{\"abcdefghij");
         assert_eq!(cache.total_len, Some(38433));
+        assert_eq!(cache.conflict, None);
+    }
+
+    /// A descriptor whose text is 26 bytes ("a".."z"), i.e. long enough to need five
+    /// frames -- the last of them padded, like the device does.
+    fn desc_cache_with_26_bytes() -> JsonDescCache {
+        let mut cache = JsonDescCache::default();
+        cache.reset();
+        let mut meta = [0u8; 8];
+        meta[2..6].copy_from_slice(&26u32.to_le_bytes());
+        meta[6..8].copy_from_slice(&0x3F82u16.to_le_bytes());
+        assert_eq!(cache.record(&meta), DescFrame::Metadata);
+        cache
+    }
+
+    const DESC_TEXT: &str = "abcdefghijklmnopqrstuvwxyz";
+
+    /// One `ChunkOffset (u16 LE) | JSON bytes` frame, padded out to the 8-byte frame.
+    fn chunk(offset: u16, text: &str) -> [u8; 8] {
+        let mut data = [0u8; 8];
+        data[0..2].copy_from_slice(&offset.to_le_bytes());
+        data[2..2 + text.len()].copy_from_slice(text.as_bytes());
+        data
+    }
+
+    #[test]
+    fn json_desc_cache_never_pads_a_hole() {
+        // Regression: this is the shape that corrupted descriptors in the field. The
+        // chunk at offset 6 never arrives, and the ones behind it land in a buffer that
+        // used to be zero filled up to their own offset -- valid UTF-8, invalid JSON, and
+        // the hole was never asked for again because the continuation offset was
+        // `bytes.len()`, the end of the last chunk received.
+        let mut cache = desc_cache_with_26_bytes();
+
+        assert_eq!(cache.record(&chunk(0, "abcdef")), DescFrame::Appended);
+        assert_eq!(cache.record(&chunk(12, "mnopqr")), DescFrame::Skipped);
+        // The run stays exactly as long as what really arrived: no padding, and the
+        // missing byte is still the one the transfer needs next.
+        assert_eq!(&cache.bytes, b"abcdef");
+        assert_eq!(cache.bytes.len(), 6, "the hole must not be padded");
+        assert_eq!(cache.orphans, 1);
+
+        // Asking at `bytes.len()` (6) yields the missing chunk, and the run continues.
+        assert_eq!(cache.record(&chunk(6, "ghijkl")), DescFrame::Appended);
+        for (offset, text) in [(12, "mnopqr"), (18, "stuvwx"), (24, "yz")] {
+            assert_eq!(cache.record(&chunk(offset, text)), DescFrame::Appended);
+        }
+        assert_eq!(&cache.bytes, DESC_TEXT.as_bytes());
+        assert_eq!(cache.bytes.len(), 26);
+        assert!(
+            !cache.bytes.contains(&0),
+            "a descriptor assembled from real frames must not contain padding"
+        );
+    }
+
+    #[test]
+    fn json_desc_cache_clamps_the_padding_of_the_last_frame() {
+        // The final frame of a transfer is padded out to the frame size; the extra bytes
+        // lie past `TotalLength` and must not extend the run.
+        let mut cache = desc_cache_with_26_bytes();
+        for (offset, text) in [(0, "abcdef"), (6, "ghijkl"), (12, "mnopqr"), (18, "stuvwx")] {
+            assert_eq!(cache.record(&chunk(offset, text)), DescFrame::Appended);
+        }
+        // "yz" plus four bytes of frame padding, exactly as the device sends it.
+        assert_eq!(cache.record(&chunk(24, "yz")), DescFrame::Appended);
+        assert_eq!(cache.bytes.len(), 26);
+        assert_eq!(&cache.bytes, DESC_TEXT.as_bytes());
+    }
+
+    #[test]
+    fn json_desc_cache_skips_residue_of_an_earlier_transfer() {
+        // An interrupted transfer leaves frames in flight; they are delivered before the
+        // answer to the next request. None of them may be stored: their offsets belong to
+        // the previous transfer, and padding up to them is exactly the old corruption.
+        let mut cache = JsonDescCache::default();
+        cache.reset();
+
+        assert_eq!(cache.record(&chunk(744, "mnopqr")), DescFrame::Skipped);
+        assert_eq!(cache.record(&chunk(750, "stuvwx")), DescFrame::Skipped);
+        assert_eq!(cache.before_meta, 2);
+        assert!(cache.bytes.is_empty(), "residue must not be stored at all");
+
+        // The real transfer then starts at offset 0 and is assembled normally.
+        let mut meta = [0u8; 8];
+        meta[2..6].copy_from_slice(&26u32.to_le_bytes());
+        meta[6..8].copy_from_slice(&0x3F82u16.to_le_bytes());
+        assert_eq!(cache.record(&meta), DescFrame::Metadata);
+        assert_eq!(cache.record(&chunk(0, "abcdef")), DescFrame::Appended);
+        assert_eq!(&cache.bytes, b"abcdef");
+        assert_eq!(cache.conflict, None);
+    }
+
+    #[test]
+    fn json_desc_cache_reports_a_stale_stream_with_another_length() {
+        // Two descriptor versions on the wire cannot be told apart, so the transfer is
+        // reported instead of guessing which one the device means.
+        let mut cache = desc_cache_with_26_bytes();
+        let mut other = [0u8; 8];
+        other[2..6].copy_from_slice(&4567u32.to_le_bytes());
+        other[6..8].copy_from_slice(&0x1234u16.to_le_bytes());
+        assert_eq!(cache.record(&other), DescFrame::Conflict);
+        let conflict = cache.conflict.clone().expect("conflict is recorded");
+        assert!(
+            conflict.contains("two different metadata frames"),
+            "{conflict}"
+        );
+        assert!(conflict.contains("TotalLength 26"), "{conflict}");
+        assert!(conflict.contains("4567"), "{conflict}");
+    }
+
+    #[test]
+    fn json_desc_cache_reports_bytes_that_change_underneath_it() {
+        let mut cache = desc_cache_with_26_bytes();
+        assert_eq!(cache.record(&chunk(0, "abcdef")), DescFrame::Appended);
+        // The device repeats a chunk it already sent, but with different content.
+        assert_eq!(cache.record(&chunk(0, "abZZZZ")), DescFrame::Conflict);
+        let conflict = cache.conflict.clone().expect("conflict is recorded");
+        assert!(
+            conflict.contains("changed during the transfer"),
+            "{conflict}"
+        );
+        assert!(conflict.contains("offset 0"), "{conflict}");
+
+        // An identical repeat is normal (the device restarts at the requested offset).
+        let mut cache = desc_cache_with_26_bytes();
+        assert_eq!(cache.record(&chunk(0, "abcdef")), DescFrame::Appended);
+        assert_eq!(cache.record(&chunk(0, "abcdef")), DescFrame::Skipped);
+        assert_eq!(cache.duplicates, 1);
+        assert_eq!(cache.conflict, None);
+        assert_eq!(&cache.bytes, b"abcdef");
+    }
+
+    #[test]
+    fn json_desc_cache_ignores_chunks_beyond_the_descriptor() {
+        let mut cache = desc_cache_with_26_bytes();
+        assert_eq!(cache.record(&chunk(26, "abcdef")), DescFrame::Skipped);
+        assert!(cache.bytes.is_empty());
+        assert_eq!(cache.skipped, 1);
+
+        // Also once the transfer has the bytes it needs: a stale frame may still arrive.
+        for (offset, text) in [(0, "abcdef"), (6, "ghijkl"), (12, "mnopqr"), (18, "stuvwx")] {
+            assert_eq!(cache.record(&chunk(offset, text)), DescFrame::Appended);
+        }
+        assert_eq!(cache.record(&chunk(24, "yz")), DescFrame::Appended);
+        assert_eq!(cache.record(&chunk(24, "yz")), DescFrame::Skipped);
+        assert_eq!(cache.bytes.len(), 26);
+        assert_eq!(cache.conflict, None);
     }
     use motor_core::bus::{CanBus, CanFrame};
     use motor_core::test_support::MockBus;
