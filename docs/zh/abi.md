@@ -80,7 +80,7 @@ ABI 对外保持一套统一控制接口。
 - Hexfellow 的 ABI 路径支持 `MIT` 和 `POS_VEL`，`VEL` / `FORCE_POS` 会返回不支持。
 - CyberBeast 的 ABI 路径四个模式都支持（`MIT` / `POS_VEL` / `VEL` / `FORCE_POS`）。`feedback_id` 仅为签名兼容保留、协议不使用：命令与反馈帧都按 `motor_id`（8 位 CAN 节点 ID）寻址。
 - CyberBeast 的 `motor_handle_ensure_mode` 只校验统一模式码并发送 `START_MOTOR`；真正的模式由每帧控制指令携带（MIT / 位置 / 速度 / 力矩报文类型），不是写模式寄存器。
-- CyberBeast 的参数访问是 16 位 ODrive SDO 端点上的 float32 通路（`motor_handle_cyberbeast_get_param_f32` / `_write_param_f32`）；完整端点表通过 `motor_handle_cyberbeast_endpoint_map` 在运行期获取（底层为 `MSG_JSON_DESC_READ`）。
+- CyberBeast 的参数访问是 16 位 ODrive SDO 端点上的 float32 通路（`motor_handle_cyberbeast_get_param_f32` / `_write_param_f32`）；完整端点表在**添加电机时**从设备读取（协议 4.8，`motor_controller_add_cyberbeast_motor` 因此在节点不应答时会失败）并由 `motor_handle_cyberbeast_endpoint_map` 返回。
 - RobStride 的 ABI 路径支持 `POS_VEL`，语义映射为原生 Position：先设置 `run_mode=1`，再写 `limit_spd` 与 `loc_ref`。
 - RobStride 的统一高层目前支持 `MIT/POS_VEL/VEL`；`TORQUE/CURRENT` 仍是参数级能力（通过 `robstride_write_param_*`），尚未开放统一模式。
 - Damiao 置零顺序规则：先调用 `motor_handle_disable`，再调用 `motor_handle_set_zero_position`；否则会被核心防护拒绝。
@@ -110,7 +110,7 @@ CyberBeast 扩展接口（ODrive SDO 端点）：
 
 - `motor_handle_cyberbeast_get_param_f32(motor, param_id, timeout_ms, out_value)`
 - `motor_handle_cyberbeast_write_param_f32(motor, param_id, value)`（等待设备写确认，预算 200 ms）
-- `motor_handle_cyberbeast_endpoint_map(motor, timeout_ms, out_total_len, out_version_crc)` 返回设备自报的 JSON 端点描述符（UTF-8；指针在本线程下次 ABI 调用前有效，失败返回 NULL）。`out_total_len` / `out_version_crc` 可为 NULL，否则回传描述符的 `TotalLength` / `VersionCRC`。用它可在运行期解析端点 ID 与类型，无需硬编码表格。Python 侧：`Motor.cyberbeast_endpoint_map(timeout_ms)` + `motorbridge.cyberbeast_endpoints.parse_endpoint_descriptor()`。
+- `motor_handle_cyberbeast_endpoint_map(motor, timeout_ms, out_total_len, out_version_crc)` 返回设备自报的 JSON 端点描述符（UTF-8；指针在本线程下次 ABI 调用前有效，失败返回 NULL）。添加电机时已缓存描述符，因此该调用通常**立即返回**，只有从未加载过时才发起传输。`out_total_len` / `out_version_crc` 可为 NULL，否则回传 `TotalLength` / `VersionCRC`。Python 侧：`Motor.cyberbeast_endpoint_map(timeout_ms)` + `motorbridge.cyberbeast_endpoints.parse_endpoint_descriptor()`。
 
 ## 典型调用顺序
 

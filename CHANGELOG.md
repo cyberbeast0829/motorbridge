@@ -21,15 +21,29 @@ Versioning.
   - Python CLI support: `--vendor cyberbeast` for `run` (all four unified modes,
     `read-param` / `write-param`, `save`, `set-zero`) and `scan`.
   - `bindings/python/examples/cyberbeast_demo.py`.
-- CyberBeast JSON endpoint descriptor access (protocol 4.8):
-  `CyberBeastMotor::read_endpoint_descriptor()` / `read_endpoint_descriptor_raw()`,
-  `motor_cli --mode endpoint-map [--out <path>] [--dump]` and
-  `motor_cli --mode find-endpoint --name <substring>`, plus the ABI entry point
-  `motor_handle_cyberbeast_endpoint_map` exposed to Python as
-  `Motor.cyberbeast_endpoint_map(timeout_ms)` with
-  `motorbridge.cyberbeast_endpoints.parse_endpoint_descriptor()`. The device's own
-  endpoint map (554 entries on the tested firmware, 38433 bytes) can now be read at
-  runtime instead of relying on a hand-maintained table.
+- CyberBeast JSON endpoint descriptor access (protocol 4.8). The device's own table
+  is **loaded when a motor is connected** and cached on the handle, so parameter
+  access never guesses a value type and never fetches the table on first use:
+  - `CyberBeastController::add_motor` loads the map (a silent node fails with a
+    message naming it, instead of handing out a handle whose table is missing);
+    `add_motor_probe` connects without touching the bus for scan loops.
+  - `EndpointMap` / `EndpointEntry` / `ParamValue` parse the descriptor (id, dotted
+    path, declared type, access) and `read_param_value` returns typed values
+    (`float`, `uint8/16/32/64`, `int8/16/32/64`, `bool`, segmented values included).
+  - CLI: `--endpoint` accepts a name or path from the device table (`gear_ratio`,
+    `axis0.motor.config.gear_ratio`) as well as an id; `read-param` prints the
+    declared type and access; `write-param` refuses endpoints the device declares
+    read-only or non-float; `status` reports the loaded table;
+    `--mode endpoint-map [--out|--dump|--refresh]` and
+    `--mode find-endpoint --name <substring>` work from the cache;
+    `--no-endpoint-map` skips the transfer for bring-up.
+  - ABI/Python: `motor_handle_cyberbeast_endpoint_map` returns the cached descriptor
+    (it only transfers when nothing is loaded), exposed as
+    `Motor.cyberbeast_endpoint_map(timeout_ms)` together with
+    `motorbridge.cyberbeast_endpoints.parse_endpoint_descriptor()`.
+  - Rust: `read_endpoint_descriptor()` / `read_endpoint_descriptor_raw()` remain for
+    explicit re-reads. The tested node reports 554 endpoints (521 values) in 38433
+    bytes, VersionCRC 0x3F82.
   `motor_cli --mode find-endpoint --name <substring>` also revealed
   `axis0.motor.config.gear_ratio` (**0x00F2**, float rw, 7.75 on the tested node),
   so the motor-side vs output-side conversion factor is now readable instead of
@@ -65,6 +79,13 @@ Versioning.
   - the JSON descriptor transfer ignores repeated metadata frames and requests the
     next chunk only after the device stops streaming, which is what makes
     `--mode endpoint-map` produce the same bytes as the independent probe.
+  - reading the same endpoint twice returned the previous answer from the cache for
+    up to the response timeout (the C ABI and therefore Python were affected: a
+    second `cyberbeast_get_param_f32` could report a stale value). A fresh read now
+    drops the earlier value, reply stamp and shape.
+  - a node that never answers `JSON_DESC_READ` used to retry 64 times (~32 s) before
+    giving up; without any descriptor metadata the transfer now fails after one
+    quiet window, so a wrong node id is reported in about 500 ms.
 
 ## [0.4.9] - 2026-07-06
 

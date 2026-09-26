@@ -32,8 +32,11 @@ pub(crate) fn write_f32(motor: &MotorHandleInner, param_id: u16, value: f32) -> 
 
 /// Read the device's JSON endpoint descriptor (protocol 4.8).
 ///
-/// Returns `(json, total_len, version_crc)`; the descriptor maps every endpoint id
-/// to its name, value type and access, so callers do not need a hardcoded table.
+/// Returns `(json, total_len, version_crc)`. The descriptor is loaded when the motor
+/// is added, so this returns the cached text immediately; it only fetches the transfer
+/// when the map was never loaded (for example a handle added through a probe path).
+/// The descriptor maps every endpoint id to its name, value type and access, so
+/// callers do not need a hardcoded table.
 pub(crate) fn read_endpoint_map(
     motor: &MotorHandleInner,
     timeout_ms: u32,
@@ -43,8 +46,10 @@ pub(crate) fn read_endpoint_map(
         _ => return Err("motor is not a CyberBeast motor".to_string()),
     };
     let timeout = Duration::from_millis(u64::from(timeout_ms).max(DEFAULT_PARAM_TIMEOUT_MS));
-    let (total_len, version_crc, json) = m
-        .read_endpoint_descriptor(timeout)
-        .map_err(|e| e.to_string())?;
-    Ok((json, total_len, u32::from(version_crc)))
+    let map = m.ensure_endpoint_map(timeout).map_err(|e| e.to_string())?;
+    Ok((
+        map.json_text().to_string(),
+        map.total_len(),
+        u32::from(map.version_crc()),
+    ))
 }

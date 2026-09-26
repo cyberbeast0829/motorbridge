@@ -144,7 +144,7 @@ Packaging note:
   - MyActuator: `add_myactuator_motor(...)`
   - RobStride: `add_robstride_motor(...)`
   - HighTorque: `add_hightorque_motor(...)`
-  - CyberBeast: `add_cyberbeast_motor(...)` (classic CAN only; SDO endpoint access through `cyberbeast_get_param_f32(...)` / `cyberbeast_write_param_f32(...)`, plus `cyberbeast_endpoint_map()` to read the device's own JSON endpoint descriptor)
+  - CyberBeast: `add_cyberbeast_motor(...)` (classic CAN only; SDO endpoint access through `cyberbeast_get_param_f32(...)` / `cyberbeast_write_param_f32(...)`). Adding a motor also loads the device's own JSON endpoint table and caches it on the handle (`cyberbeast_endpoint_map()`, ~2 s over slcan), so a node that does not answer makes `add_cyberbeast_motor` fail instead of leaving parameter access without a table.
 - Unified state-query pattern:
   - Recommended flow: `request_feedback() -> poll_feedback_once() -> get_state()`.
   - RobStride has no single-shot private-protocol status request; `request_feedback()` is a non-blocking no-op for RobStride. Use `robstride_ping()` for connectivity, active report for streaming state, or typed parameter reads for fresh position/velocity values.

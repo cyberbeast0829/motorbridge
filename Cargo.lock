@@ -278,7 +278,6 @@ dependencies = [
  "motor_vendor_robstride",
  "motor_vendor_robstride_cia402",
  "motor_vendor_robstride_mit",
- "serde_json",
 ]
 
 [[package]]
@@ -295,6 +294,7 @@ name = "motor_vendor_cyberbeast"
 version = "0.5.0"
 dependencies = [
  "motor_core",
+ "serde_json",
 ]
 
 [[package]]

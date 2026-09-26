@@ -233,6 +233,8 @@ CyberBeast modes:\n\
   monitor is fully passive (no frame is transmitted). keep-alive sends QueryStatus/QueryPosVel only.\n\
   endpoint-map fetches the device's own JSON endpoint descriptor (JSON_DESC_READ 0x24).\n\
   find-endpoint searches that descriptor by name (--name <substring>).\n\
+  Connecting a motor already loads that descriptor: add --no-endpoint-map to skip it\n\
+  (bring-up only: parameter reads then fail, and --endpoint takes a numeric id only).\n\
   estop is a global broadcast (Priority=0, MsgType=0xC0, Dest=0xFF): every device on\n\
   the bus stops and latches an ESTOP error, cleared only by clear-error or a reset.\n\
   set-zero and write-param require --yes.\n\n\
@@ -242,11 +244,14 @@ CyberBeast extras:\n\
   --loop-ms <ms>       control loop period, default 5 (mit/torque) or 10 (pos/vel)\n\
   --vel-limit <rpm>    pos mode velocity limit, default 100\n\
   --cur-limit <A>      pos/vel mode current limit, default 200 (<= 0 means unspecified)\n\
-  --endpoint <hex|dec> SDO endpoint for read-param/write-param (alias: --param-id)\n\
+  --endpoint <id|name> read-param/write-param: endpoint id (0x00F2) or a name/path\n\
+                       from the device's own table (gear_ratio, axis0.motor.config...)\n\
   --value <float>      value for write-param; the write is read back and verified\n\
   --timeout-ms <ms>    SDO response timeout, default 200 (endpoint-map: stall window, default 500)\n\
   --out <path>         endpoint-map: write the descriptor JSON to this file\n\
   --dump               endpoint-map: also print the descriptor JSON here\n\
+  --refresh            endpoint-map: re-read the descriptor instead of using the cache\n\
+  --no-endpoint-map    skip loading the descriptor when connecting (bring-up only)\n\
   --name <substring>   find-endpoint: case-insensitive endpoint name filter\n\
   --keep-alive-ms <ms> keep-alive query period, default 500\n\
   --duration-s <s>     run time for monitor/keep-alive, 0 = until Ctrl+C\n\

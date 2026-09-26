@@ -1,3 +1,4 @@
+use crate::endpoint_map::{decode_value, EndpointMap, ParamReadout};
 use crate::protocol::{
     self, can_id_parts, encode_clear_errors, encode_config_save, encode_current_control,
     encode_json_desc_read, encode_param_read_at, encode_param_write, encode_pos_control,
@@ -398,6 +399,10 @@ pub struct CyberBeastMotor {
     param_cache: Mutex<ParamCache>,
     /// JSON endpoint descriptor transfer state (protocol 4.8).
     json_desc: Mutex<JsonDescCache>,
+    /// Parsed endpoint map of this node, loaded once when the handle is created.
+    ///
+    /// Kept in an `Arc` so readers can use the table without holding the lock.
+    endpoint_map: Mutex<Option<Arc<EndpointMap>>>,
 }
 
 impl CyberBeastMotor {
@@ -427,6 +432,7 @@ impl CyberBeastMotor {
             mit_current_limit: AtomicU32::new(DEFAULT_MIT_CURRENT_LIMIT.to_bits()),
             param_cache: Mutex::new(ParamCache::new()),
             json_desc: Mutex::new(JsonDescCache::default()),
+            endpoint_map: Mutex::new(None),
         })
     }
 
@@ -677,8 +683,12 @@ impl CyberBeastMotor {
 
     /// Send a PARAM_READ request for a specific byte offset inside the value.
     ///
-    /// Offset 0 starts a new read sequence and drops any previously assembled
-    /// bytes; later offsets continue a segmented read.
+    /// Offset 0 starts a new read sequence and drops everything the previous read
+    /// assembled. That matters when the same endpoint is read twice: the cached
+    /// value/reply/shape of the earlier read must never be mistaken for this read's
+    /// answer, otherwise a second read returns a stale value instantly instead of
+    /// asking the device (and a segmented value would concat onto the previous one).
+    /// Later offsets continue a segmented read without clearing.
     pub fn send_param_read_at(&self, endpoint_id: u16, offset: u32) -> Result<()> {
         {
             let mut cache = self
@@ -688,6 +698,9 @@ impl CyberBeastMotor {
             cache.pending_read = Some(endpoint_id);
             if offset == 0 {
                 cache.raw.remove(&endpoint_id);
+                cache.shapes.remove(&endpoint_id);
+                cache.values.remove(&endpoint_id);
+                cache.reply_time.remove(&endpoint_id);
             }
         }
         let data = encode_param_read_at(endpoint_id, offset);
@@ -853,6 +866,15 @@ impl CyberBeastMotor {
                 last_received = received;
                 quiet_deadline = Instant::now() + timeout;
             } else if Instant::now() > quiet_deadline {
+                if total_len.is_none() {
+                    // Nothing at all came back: stop instead of retrying 64 times,
+                    // which would turn a wrong node id into a ~30 s stall.
+                    return Err(MotorError::Timeout(format!(
+                        "no JSON descriptor metadata from node 0x{:02X} within {timeout:?} \
+                         (wrong node id, silent node, or no access to the endpoint map?)",
+                        self.motor_id
+                    )));
+                }
                 if requests >= MAX_JSON_DESC_REQUESTS {
                     return Err(MotorError::Timeout(format!(
                         "endpoint descriptor transfer gave up after {requests} requests ({received} of {} bytes)",
@@ -879,6 +901,83 @@ impl CyberBeastMotor {
         };
         let bytes = bytes[..total_len as usize].to_vec();
         Ok((total_len, version_crc, bytes))
+    }
+
+    /// Read the device's endpoint descriptor, parse it and cache the resulting table.
+    ///
+    /// Callers usually do not need this: adding a motor through
+    /// [`crate::CyberBeastController::add_motor`] loads the map, so `read_param` and
+    /// `write_param` always have the device's complete table available. Call it again
+    /// to pick up a changed map, for example after a firmware update.
+    pub fn load_endpoint_map(&self, timeout: Duration) -> Result<Arc<EndpointMap>> {
+        let (total_len, version_crc, json) = self.read_endpoint_descriptor(timeout)?;
+        let map = Arc::new(EndpointMap::parse(&json)?.with_metadata(total_len, version_crc));
+        if map.is_empty() {
+            return Err(MotorError::Protocol(format!(
+                "endpoint descriptor ({total_len} bytes, VersionCRC=0x{version_crc:04X}) describes no endpoints"
+            )));
+        }
+        let mut slot = self
+            .endpoint_map
+            .lock()
+            .map_err(|_| MotorError::Io("endpoint map lock poisoned".into()))?;
+        *slot = Some(Arc::clone(&map));
+        Ok(map)
+    }
+
+    /// The cached endpoint map, loading it first when it has not been loaded yet.
+    pub fn ensure_endpoint_map(&self, timeout: Duration) -> Result<Arc<EndpointMap>> {
+        match self.endpoint_map() {
+            Some(map) => Ok(map),
+            None => self.load_endpoint_map(timeout),
+        }
+    }
+
+    /// The cached endpoint map, if one has been loaded.
+    pub fn endpoint_map(&self) -> Option<Arc<EndpointMap>> {
+        self.endpoint_map
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(Arc::clone))
+    }
+
+    /// Read an endpoint with the type the device declares for it.
+    ///
+    /// The cached endpoint map supplies the value type and the dotted path, so the
+    /// result is typed instead of guessed (`uint32`, `bool` and 8-byte endpoints
+    /// included). An id the device does not have is `InvalidArgument`, and endpoints
+    /// declared as functions or references are `Unsupported`.
+    pub fn read_param_value(&self, endpoint_id: u16, timeout: Duration) -> Result<ParamReadout> {
+        let map = self.endpoint_map().ok_or_else(|| {
+            MotorError::Unsupported(
+                "the endpoint map of this motor is not loaded; add it through \
+                 CyberBeastController::add_motor (or call load_endpoint_map) before reading parameters"
+                    .to_string(),
+            )
+        })?;
+        let entry = map.get(endpoint_id).ok_or_else(|| {
+            MotorError::InvalidArgument(format!(
+                "endpoint 0x{endpoint_id:04X} ({endpoint_id}) is not in the device's endpoint map ({} entries, VersionCRC=0x{:04X})",
+                map.len(),
+                map.version_crc()
+            ))
+        })?;
+        let value_type = entry.value_type().ok_or_else(|| {
+            MotorError::Unsupported(format!(
+                "endpoint 0x{endpoint_id:04X} ({}) is declared \"{}\" and cannot be read with PARAM_READ",
+                entry.path, entry.raw_type
+            ))
+        })?;
+        let raw = self.read_param_raw(endpoint_id, timeout)?;
+        let value = decode_value(&raw, value_type)?;
+        Ok(ParamReadout {
+            endpoint_id,
+            path: Some(entry.path.clone()),
+            declared: entry.raw_type.clone(),
+            access: entry.access,
+            value,
+            raw,
+        })
     }
 
     /// Current range used to decode MIT response current values (A).

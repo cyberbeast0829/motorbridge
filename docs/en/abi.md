@@ -83,7 +83,7 @@ Behavior rule:
 - Hexfellow ABI path supports MIT and POS_VEL, and reports `VEL` / `FORCE_POS` as unsupported.
 - CyberBeast ABI path supports MIT / POS_VEL / VEL / FORCE_POS. `feedback_id` is accepted for signature parity but ignored: command and feedback frames are addressed by `motor_id` (8-bit CAN node ID).
 - CyberBeast `motor_handle_ensure_mode` validates the unified mode code and sends `START_MOTOR`; the active mode is carried by each control frame (MIT / position / velocity / torque message type), not by a mode register write.
-- CyberBeast parameter access is float32-only over 16-bit ODrive SDO endpoints (`motor_handle_cyberbeast_get_param_f32` / `_write_param_f32`); the endpoint map itself is discovered at runtime via `MSG_JSON_DESC_READ`.
+- CyberBeast parameter access is float32-only over 16-bit ODrive SDO endpoints (`motor_handle_cyberbeast_get_param_f32` / `_write_param_f32`); the endpoint map itself is loaded from the device (protocol 4.8) when the motor is added (`motor_controller_add_cyberbeast_motor`, which therefore can fail on a silent node) and is returned by `motor_handle_cyberbeast_endpoint_map`.
 - RobStride supports MIT / POS_VEL / VEL on unified APIs; torque/current remains parameter-level (`robstride_write_param_*`), not a unified mode.
 - Damiao set-zero sequence rule: call `motor_handle_disable` before `motor_handle_set_zero_position`; otherwise set-zero is rejected by core guard.
 - Damiao set-zero settle rule: core applies an internal fixed settle (`~20ms`) after successful `set_zero_position` (no extra ABI parameter).
@@ -112,7 +112,7 @@ CyberBeast extensions (ODrive SDO endpoints):
 
 - `motor_handle_cyberbeast_get_param_f32(motor, param_id, timeout_ms, out_value)`
 - `motor_handle_cyberbeast_write_param_f32(motor, param_id, value)` (waits for the device write acknowledgment, 200 ms budget)
-- `motor_handle_cyberbeast_endpoint_map(motor, timeout_ms, out_total_len, out_version_crc)` returns the device's own JSON endpoint descriptor (UTF-8; valid until the next ABI call on this thread, NULL on failure). `out_total_len` and `out_version_crc` may be NULL, otherwise they report the descriptor's `TotalLength` / `VersionCRC`. Use it to resolve endpoint ids and value types at runtime instead of hardcoding them. Python: `Motor.cyberbeast_endpoint_map(timeout_ms)` + `motorbridge.cyberbeast_endpoints.parse_endpoint_descriptor()`.
+- `motor_handle_cyberbeast_endpoint_map(motor, timeout_ms, out_total_len, out_version_crc)` returns the device's own JSON endpoint descriptor (UTF-8; valid until the next ABI call on this thread, NULL on failure). The descriptor is cached when the motor is added, so this returns it immediately and only transfers it when nothing is loaded yet. `out_total_len` and `out_version_crc` may be NULL, otherwise they report the descriptor's `TotalLength` / `VersionCRC`. Python: `Motor.cyberbeast_endpoint_map(timeout_ms)` + `motorbridge.cyberbeast_endpoints.parse_endpoint_descriptor()`.
 
 ## Typical Call Flow
 

@@ -1,9 +1,9 @@
-use crate::args::{get_f32, get_opt_u16_hex_or_dec, get_str, get_u16_hex_or_dec, get_u64};
+use crate::args::{get_f32, get_str, get_u16_hex_or_dec, get_u64};
 use motor_core::bus::{open_can_bus, CanBus, CanFrame};
 use motor_core::error::Result as MotorResult;
 use motor_vendor_cyberbeast::{
     big_endian_bytes_to_f32, can_id_parts, decode_heartbeat, CyberBeastController, CyberBeastMotor,
-    CyberBeastMotorState, ModeState, MsgType, REGISTER_TABLE,
+    CyberBeastMotorState, ModeState, MsgType, ParamReadout, ParamValue, ValueType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -285,136 +285,69 @@ fn get_torque(args: &HashMap<String, String>) -> Result<f32, String> {
 }
 
 /// `--endpoint` is the canonical spelling; `--param-id` (Python CLI spelling) is accepted too.
-fn get_endpoint(args: &HashMap<String, String>) -> Result<u16, String> {
-    if let Some(value) = get_opt_u16_hex_or_dec(args, "endpoint")? {
-        return Ok(value);
-    }
-    if let Some(value) = get_opt_u16_hex_or_dec(args, "param-id")? {
-        return Ok(value);
+///
+/// The value is returned as written: it may be an id (`0x00F2`) or a name/path that
+/// the device's own endpoint table resolves (`gear_ratio`).
+fn get_endpoint_spec(args: &HashMap<String, String>) -> Result<String, String> {
+    for key in ["endpoint", "param-id"] {
+        if let Some(value) = args.get(key) {
+            return Ok(value.clone());
+        }
     }
     Err(
-        "--endpoint <hex|dec> is required for read-param/write-param (alias: --param-id)"
+        "--endpoint <id|name> is required for read-param/write-param (alias: --param-id)"
             .to_string(),
     )
 }
 
-/// Human-readable name for a documented SDO endpoint, if the static table knows it.
-fn endpoint_name(endpoint: u16) -> Option<&'static str> {
-    REGISTER_TABLE
-        .iter()
-        .find(|info| info.endpoint_id == endpoint)
-        .map(|info| info.variable)
+/// Resolve `--endpoint` into an id: a number, or a name/path from the device's table.
+fn resolve_endpoint(
+    motor: &CyberBeastMotor,
+    spec: &str,
+) -> Result<u16, Box<dyn std::error::Error>> {
+    match motor.endpoint_map() {
+        Some(map) => Ok(map.resolve(spec)?.endpoint_id),
+        None => crate::args::parse_u16_hex_or_dec(spec, "--endpoint").map_err(|_| {
+            format!(
+                "\"{spec}\" is not a numeric endpoint id and the device's endpoint table is not \
+                 loaded (--no-endpoint-map?); use an id such as 0x00F2"
+            )
+            .into()
+        }),
+    }
 }
 
-/// Declared value type of a documented SDO endpoint, as reported by the device descriptor.
-fn endpoint_type(endpoint: u16) -> &'static str {
-    REGISTER_TABLE
-        .iter()
-        .find(|info| info.endpoint_id == endpoint)
-        .map(|info| info.value_type)
-        .unwrap_or("unknown")
-}
-
-fn le_array<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
-    bytes.get(..N).and_then(|slice| slice.try_into().ok())
-}
-
-/// Decode little-endian value bytes using the type declared by the device descriptor.
+/// Adds motors through the controller.
 ///
-/// Firmware 0.6.9 answers PARAM_READ with **little-endian** values (verified on
-/// hardware: vbus 23.09 V, torque_constant 0.0824, cpr 16384), even though
-/// protocol 4.7 documents big-endian.
-fn decode_param_value(declared: &str, bytes: &[u8]) -> String {
-    let undecodable = || unknown_value(bytes);
-    match declared.split_whitespace().next().unwrap_or("") {
-        "float" => {
-            le_array::<4>(bytes).map_or_else(undecodable, |b| f32::from_le_bytes(b).to_string())
-        }
-        "uint8" => bytes.first().map_or_else(undecodable, |b| b.to_string()),
-        "int8" => bytes
-            .first()
-            .map_or_else(undecodable, |b| (*b as i8).to_string()),
-        "bool" => bytes
-            .first()
-            .map_or_else(undecodable, |b| (*b != 0).to_string()),
-        "uint16" => {
-            le_array::<2>(bytes).map_or_else(undecodable, |b| u16::from_le_bytes(b).to_string())
-        }
-        "int16" => {
-            le_array::<2>(bytes).map_or_else(undecodable, |b| i16::from_le_bytes(b).to_string())
-        }
-        "uint32" => {
-            le_array::<4>(bytes).map_or_else(undecodable, |b| u32::from_le_bytes(b).to_string())
-        }
-        "int32" => {
-            le_array::<4>(bytes).map_or_else(undecodable, |b| i32::from_le_bytes(b).to_string())
-        }
-        "uint64" => {
-            le_array::<8>(bytes).map_or_else(undecodable, |b| u64::from_le_bytes(b).to_string())
-        }
-        _ => {
-            let as_f32 = le_array::<4>(bytes).map(f32::from_le_bytes);
-            let as_i32 = le_array::<4>(bytes).map(i32::from_le_bytes);
-            match (as_f32, as_i32) {
-                (Some(f), Some(i)) => format!(
-                    "{f} (if float32 LE) / {i} (if int32 LE); type unknown for this endpoint"
-                ),
-                _ => unknown_value(bytes),
-            }
+/// Connecting loads the node's endpoint map (protocol 4.8) so every later
+/// `read-param` / `write-param` uses the device's own table. `--no-endpoint-map`
+/// switches to a probe connection that sends nothing, for bring-up on a node whose
+/// descriptor transfer is broken.
+struct MotorAdder<'a> {
+    ctrl: &'a CyberBeastController,
+    load_map: bool,
+}
+
+impl MotorAdder<'_> {
+    fn add(
+        &self,
+        motor_id: u16,
+        model: &str,
+    ) -> Result<Arc<CyberBeastMotor>, Box<dyn std::error::Error>> {
+        if self.load_map {
+            Ok(self.ctrl.add_motor(motor_id, motor_id, model)?)
+        } else {
+            Ok(self.ctrl.add_motor_probe(motor_id, motor_id, model)?)
         }
     }
 }
 
-fn unknown_value(bytes: &[u8]) -> String {
-    format!(
-        "(no decoder for {} byte(s): {})",
-        bytes.len(),
-        bytes
-            .iter()
-            .map(|b| format!("{b:02X}"))
-            .collect::<Vec<_>>()
-            .join(" ")
-    )
-}
-
-/// Walk the descriptor tree and collect `(name, id, type, access)` for nested objects too.
-fn collect_endpoint_entries(
-    value: &serde_json::Value,
-    prefix: &str,
-    out: &mut Vec<(String, u64, String, String)>,
-) {
-    match value {
-        serde_json::Value::Object(map) => {
-            let name = map.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let path = if prefix.is_empty() || name.is_empty() {
-                format!("{prefix}{name}")
-            } else {
-                format!("{prefix}.{name}")
-            };
-            if let Some(id) = map.get("id").and_then(|v| v.as_u64()) {
-                let value_type = map
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let access = map.get("access").and_then(|v| v.as_str()).unwrap_or("-");
-                out.push((path.clone(), id, value_type.to_string(), access.to_string()));
-            }
-            for (key, child) in map {
-                if matches!(key.as_str(), "name" | "id" | "type" | "access") {
-                    continue;
-                }
-                if child.is_object() || child.is_array() {
-                    collect_endpoint_entries(child, &path, out);
-                }
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                collect_endpoint_entries(item, prefix, out);
-            }
-        }
-        _ => {}
-    }
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn run_cyberbeast(
@@ -432,6 +365,18 @@ pub fn run_cyberbeast(
     } else {
         CyberBeastController::new_socketcan(channel)?
     };
+    // Connecting loads the device's endpoint table, so read-param/write-param never
+    // have to guess a value type or fetch a table on first use.
+    let adder = MotorAdder {
+        ctrl: &ctrl,
+        load_map: !args.contains_key("no-endpoint-map"),
+    };
+    if !adder.load_map {
+        eprintln!(
+            "warning: --no-endpoint-map: the device's endpoint table is not loaded, so parameter \
+             reads will fail and --endpoint only accepts a numeric id"
+        );
+    }
 
     match mode.as_str() {
         "scan" => {
@@ -449,7 +394,9 @@ pub fn run_cyberbeast(
 
             let mut responders = 0u32;
             for id in start_id..=end_id {
-                let motor = match ctrl.add_motor(id, id, model) {
+                // A scan probes ids that are expected to be silent, so it must not load
+                // every candidate's endpoint descriptor.
+                let motor = match ctrl.add_motor_probe(id, id, model) {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
@@ -483,10 +430,14 @@ pub fn run_cyberbeast(
         }
 
         "status" => {
-            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            let motor = adder.add(motor_id, model)?;
             println!(
                 "status for motor 0x{motor_id:02X} on {channel} (query-only: no StartMotor/StopMotor frame is sent)"
             );
+            match motor.endpoint_map() {
+                Some(map) => println!("  endpoint map: {}", map.summary()),
+                None => println!("  endpoint map: not loaded (--no-endpoint-map)"),
+            }
             let mut snapshot = Snapshot::default();
             let _ = motor.send_query_status();
             pump(&ctrl, &motor, QUERY_TIMEOUT_MS + 100, &mut snapshot);
@@ -537,7 +488,7 @@ pub fn run_cyberbeast(
         }
 
         "mit" => {
-            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            let motor = adder.add(motor_id, model)?;
             apply_mit_current_range(&motor, PARAM_TIMEOUT_MS);
             let kp = get_f32(args, "kp", 100.0)?;
             let kd = get_f32(args, "kd", 10.0)?;
@@ -574,7 +525,7 @@ pub fn run_cyberbeast(
         }
 
         "pos" => {
-            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            let motor = adder.add(motor_id, model)?;
             apply_mit_current_range(&motor, PARAM_TIMEOUT_MS);
             let target_pos = get_f32(args, "pos", 0.0)?;
             let vel_limit = get_f32(args, "vel-limit", 100.0)?;
@@ -608,7 +559,7 @@ pub fn run_cyberbeast(
         }
 
         "vel" => {
-            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            let motor = adder.add(motor_id, model)?;
             apply_mit_current_range(&motor, PARAM_TIMEOUT_MS);
             let target_vel = get_f32(args, "vel", 0.0)?;
             // Current limit [A]. Default exceeds hardware max so the firmware torque_lim clamp is inert.
@@ -641,7 +592,7 @@ pub fn run_cyberbeast(
         }
 
         "torque" => {
-            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            let motor = adder.add(motor_id, model)?;
             apply_mit_current_range(&motor, PARAM_TIMEOUT_MS);
             let target_torque = get_torque(args)?;
             let loop_ms = get_u64(args, "loop-ms", 5)?;
@@ -672,7 +623,7 @@ pub fn run_cyberbeast(
         }
 
         "enable" => {
-            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            let motor = adder.add(motor_id, model)?;
             motor.send_start_motor()?;
             println!(
                 "enabled motor 0x{motor_id:02X} (StartMotor 0x62 sent; the device stays enabled after this CLI exits)"
@@ -681,14 +632,14 @@ pub fn run_cyberbeast(
         }
 
         "disable" => {
-            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            let motor = adder.add(motor_id, model)?;
             motor.send_stop_motor()?;
             println!("disabled motor 0x{motor_id:02X} (StopMotor 0x63 sent)");
             ctrl.shutdown()?;
         }
 
         "estop" => {
-            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            let motor = adder.add(motor_id, model)?;
             println!(
                 "warning: ESTOP is a global broadcast (Priority=0, MsgType=0xC0, Dest=0xFF per protocol 4.9): every device on {channel} stops and latches an ESTOP error, cleared only by clear-error or a reset"
             );
@@ -698,7 +649,7 @@ pub fn run_cyberbeast(
         }
 
         "clear-error" | "clear-fault" => {
-            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            let motor = adder.add(motor_id, model)?;
             motor.send_clear_errors()?;
             println!("clear-errors (0x65) sent to 0x{motor_id:02X}; re-read status to verify");
             ctrl.shutdown()?;
@@ -711,7 +662,7 @@ pub fn run_cyberbeast(
                         .into(),
                 );
             }
-            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            let motor = adder.add(motor_id, model)?;
             motor.send_set_zero()?;
             println!(
                 "set-zero (0x61) sent to 0x{motor_id:02X}; re-read status to confirm the new zero"
@@ -721,31 +672,27 @@ pub fn run_cyberbeast(
 
         // SDO endpoint read/write (fibre endpoint system, protocol 4.7 / 4.8).
         "read-param" => {
-            let endpoint = get_endpoint(args)?;
+            let spec = get_endpoint_spec(args)?;
             let timeout_ms = get_u64(args, "timeout-ms", PARAM_TIMEOUT_MS)?;
-            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
-            // read_param_raw sends the request itself and follows the More flag, so
-            // it works for every value width, not just 4-byte float32.
-            let bytes = motor.read_param_raw(endpoint, Duration::from_millis(timeout_ms))?;
-            let name = endpoint_name(endpoint).unwrap_or("not in the verified endpoint table");
-            let declared = endpoint_type(endpoint);
+            let motor = adder.add(motor_id, model)?;
+            let endpoint = resolve_endpoint(&motor, &spec)?;
+            // The device's own table says how wide this endpoint is, so the value is
+            // decoded with its declared type instead of a guess.
+            let readout = motor.read_param_value(endpoint, Duration::from_millis(timeout_ms))?;
             println!(
-                "endpoint 0x{endpoint:04X} ({name}) declared={declared} value={}",
-                decode_param_value(declared, &bytes)
+                "endpoint 0x{:04X} ({}) declared={} access={} value={}",
+                readout.endpoint_id,
+                readout.path.as_deref().unwrap_or("?"),
+                readout.declared,
+                readout.access.label(),
+                readout.value
             );
-            println!(
-                "  raw little-endian bytes: [{}]",
-                bytes
-                    .iter()
-                    .map(|b| format!("{b:02X}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
+            println!("  raw little-endian bytes: [{}]", hex_bytes(&readout.raw));
             ctrl.shutdown()?;
         }
 
         "write-param" => {
-            let endpoint = get_endpoint(args)?;
+            let spec = get_endpoint_spec(args)?;
             if !args.contains_key("value") {
                 return Err("--value <float> is required for write-param".into());
             }
@@ -756,22 +703,53 @@ pub fn run_cyberbeast(
             }
             let requested = get_f32(args, "value", 0.0)?;
             let timeout_ms = get_u64(args, "timeout-ms", PARAM_TIMEOUT_MS)?;
-            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
-            motor.send_param_read(endpoint)?;
-            let before = motor
-                .get_param_f32(endpoint, Duration::from_millis(timeout_ms))
-                .ok();
+            let motor = adder.add(motor_id, model)?;
+            let endpoint = resolve_endpoint(&motor, &spec)?;
+            let timeout = Duration::from_millis(timeout_ms);
+            // The device's own table decides what may be written: refuse a read-only
+            // endpoint, or one whose value is not a float32, instead of pushing four
+            // bytes into a one-byte endpoint and calling it success.
+            if let Some(map) = motor.endpoint_map() {
+                let entry = map.get(endpoint).ok_or_else(|| {
+                    format!("endpoint 0x{endpoint:04X} is not in the device's endpoint table")
+                })?;
+                if !entry.access.is_writable() {
+                    return Err(format!(
+                        "endpoint 0x{endpoint:04X} ({}) is declared access=\"{}\"; refusing to write it",
+                        entry.path,
+                        entry.access.label()
+                    )
+                    .into());
+                }
+                if entry.value_type() != Some(ValueType::F32) {
+                    return Err(format!(
+                        "endpoint 0x{endpoint:04X} ({}) is declared \"{}\"; write-param writes \
+                         float32 only so far, so this would send a mismatched width",
+                        entry.path, entry.raw_type
+                    )
+                    .into());
+                }
+            }
+            let before = motor.read_param_value(endpoint, timeout).ok();
             motor.set_param_f32(endpoint, requested)?;
-            motor.send_param_read(endpoint)?;
-            let read_back = motor
-                .get_param_f32(endpoint, Duration::from_millis(timeout_ms))
-                .ok();
-            let name = endpoint_name(endpoint).unwrap_or("?");
+            let read_back = motor.read_param_value(endpoint, timeout).ok();
+            let show = |value: &Option<ParamReadout>| {
+                value
+                    .as_ref()
+                    .map(|readout| format!("{} ({})", readout.value, readout.declared))
+                    .unwrap_or_else(|| "unreadable".to_string())
+            };
+            let path = read_back
+                .as_ref()
+                .and_then(|readout| readout.path.clone())
+                .unwrap_or_else(|| format!("0x{endpoint:04X}"));
             println!(
-                "endpoint 0x{endpoint:04X} ({name}): requested={requested} before={before:?} read_back={read_back:?}"
+                "endpoint {path}: requested={requested} before={} read_back={}",
+                show(&before),
+                show(&read_back)
             );
-            match read_back {
-                Some(value) => {
+            match read_back.map(|readout| readout.value) {
+                Some(ParamValue::F32(value)) => {
                     let delta = (value - requested).abs();
                     if delta <= f32::EPSILON * requested.abs().max(1.0) {
                         println!("  verified: the device reports the requested value");
@@ -781,6 +759,12 @@ pub fn run_cyberbeast(
                         )
                         .into());
                     }
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "endpoint 0x{endpoint:04X} read back as {other}, which cannot be compared with {requested}"
+                    )
+                    .into());
                 }
                 None => {
                     return Err(format!(
@@ -792,50 +776,52 @@ pub fn run_cyberbeast(
             ctrl.shutdown()?;
         }
 
-        // Read-only: look an endpoint up by name in the device's own descriptor.
+        // Read-only: look an endpoint up by name in the device's own table.
         "find-endpoint" => {
-            let Some(name_filter) = args.get("name") else {
+            let Some(needle) = args.get("name") else {
                 return Err("--name <substring> is required for find-endpoint".into());
             };
-            let filter = name_filter.to_lowercase();
             let timeout_ms = get_u64(args, "timeout-ms", 500)?;
-            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
-            let (total_len, version_crc, json) =
-                motor.read_endpoint_descriptor(Duration::from_millis(timeout_ms))?;
-            let root: serde_json::Value = serde_json::from_str(&json)
-                .map_err(|err| format!("descriptor is not valid JSON: {err}"))?;
-            let mut entries = Vec::new();
-            collect_endpoint_entries(&root, "", &mut entries);
+            let motor = adder.add(motor_id, model)?;
+            let map = motor.ensure_endpoint_map(Duration::from_millis(timeout_ms))?;
             let mut shown = 0usize;
-            for (name, id, value_type, access) in &entries {
-                if name.to_lowercase().contains(&filter) {
-                    shown += 1;
-                    println!("  id=0x{id:04X} ({id:5}) {value_type:<9} {access:<4} {name}");
-                }
+            for entry in map.find(needle) {
+                shown += 1;
+                println!(
+                    "  id=0x{:04X} ({:5}) {:<9} {:<4} {}",
+                    entry.endpoint_id,
+                    entry.endpoint_id,
+                    entry.raw_type,
+                    entry.access.label(),
+                    entry.path
+                );
             }
             println!(
-                "  {shown} of {} endpoints match \"{name_filter}\" (descriptor {total_len} bytes, VersionCRC=0x{version_crc:04X})",
-                entries.len()
+                "  {shown} of {} endpoints match \"{needle}\" ({})",
+                map.len(),
+                map.summary()
             );
             ctrl.shutdown()?;
         }
 
-        // Read-only: fetch the device's own endpoint descriptor (protocol 4.8).
+        // Read-only: the device's own endpoint descriptor (protocol 4.8).
         "endpoint-map" => {
-            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
             let timeout_ms = get_u64(args, "timeout-ms", 500)?;
-            println!(
-                "fetching the JSON endpoint descriptor from 0x{motor_id:02X} (JSON_DESC_READ 0x24 / JSON_DESC_DATA 0x25), stall window {timeout_ms} ms"
-            );
-            let (total_len, version_crc, json) =
-                motor.read_endpoint_descriptor(Duration::from_millis(timeout_ms))?;
-            println!(
-                "  descriptor: {total_len} bytes, VersionCRC=0x{version_crc:04X}, {} \"id\" occurrences",
-                json.matches("\"id\"").count()
-            );
+            let motor = adder.add(motor_id, model)?;
+            let timeout = Duration::from_millis(timeout_ms);
+            let map = if args.contains_key("refresh") {
+                println!(
+                    "re-reading the endpoint descriptor from 0x{motor_id:02X} (JSON_DESC_READ 0x24), stall window {timeout_ms} ms"
+                );
+                motor.load_endpoint_map(timeout)?
+            } else {
+                // Already loaded when this motor was connected.
+                motor.ensure_endpoint_map(timeout)?
+            };
+            println!("  descriptor: {}", map.summary());
             match args.get("out") {
                 Some(path) => {
-                    std::fs::write(path, json.as_bytes())
+                    std::fs::write(path, map.json_text().as_bytes())
                         .map_err(|err| format!("cannot write {path}: {err}"))?;
                     println!("  wrote {path}");
                 }
@@ -844,14 +830,15 @@ pub fn run_cyberbeast(
                 }
             }
             if args.contains_key("dump") {
-                print!("{json}");
+                print!("{}", map.json_text());
             }
             ctrl.shutdown()?;
         }
 
         // Passive link/state monitor: never transmits a frame.
         "monitor" => {
-            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            // Passive by contract: connect without loading the endpoint map.
+            let motor = ctrl.add_motor_probe(motor_id, motor_id, model)?;
             let duration_s = get_u64(args, "duration-s", 0)?;
             sigint::install();
             println!(
@@ -918,7 +905,7 @@ pub fn run_cyberbeast(
 
         // Query keep-alive: sends QueryStatus / QueryPosVel only, never enable or control frames.
         "keep-alive" => {
-            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            let motor = adder.add(motor_id, model)?;
             let period_ms = get_u64(args, "keep-alive-ms", 500)?;
             let duration_s = get_u64(args, "duration-s", 0)?;
             if period_ms == 0 {
@@ -983,59 +970,27 @@ pub fn run_cyberbeast(
 mod tests {
     use super::*;
 
-    #[test]
-    fn collect_endpoint_entries_walks_nested_objects() {
-        // Shape mirrors the device descriptor: nested objects carry their own id,
-        // so `find-endpoint` must report the dotted path, not just the leaf name.
-        let json = r#"[
-            {"name":"axis0","id":14,"type":"object","children":[
-                {"name":"config","id":21,"type":"object","children":[
-                    {"name":"node_id","id":180,"type":"uint32","access":"rw"}]},
-                {"name":"current_state","id":142,"type":"uint8","access":"r"}]}]"#;
-        let root: serde_json::Value = serde_json::from_str(json).expect("fixture is valid json");
-        let mut entries = Vec::new();
-
-        collect_endpoint_entries(&root, "", &mut entries);
-
-        assert_eq!(
-            entries,
-            vec![
-                (
-                    "axis0".to_string(),
-                    14,
-                    "object".to_string(),
-                    "-".to_string()
-                ),
-                (
-                    "axis0.config".to_string(),
-                    21,
-                    "object".to_string(),
-                    "-".to_string()
-                ),
-                (
-                    "axis0.config.node_id".to_string(),
-                    180,
-                    "uint32".to_string(),
-                    "rw".to_string()
-                ),
-                (
-                    "axis0.current_state".to_string(),
-                    142,
-                    "uint8".to_string(),
-                    "r".to_string()
-                ),
-            ]
-        );
+    fn args_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
     }
 
     #[test]
-    fn collect_endpoint_entries_ignores_objects_without_id() {
-        let root: serde_json::Value =
-            serde_json::from_str(r#"{"name":"meta","children":[{"name":"x"}]}"#).expect("json");
-        let mut entries = Vec::new();
+    fn get_endpoint_spec_accepts_ids_and_names() {
+        // The spec stays a string: the device's table decides whether it is a name.
+        assert_eq!(
+            get_endpoint_spec(&args_of(&[("endpoint", "0x00F2")])).expect("id"),
+            "0x00F2"
+        );
+        // `--param-id` is the Python CLI spelling of the same option.
+        assert_eq!(
+            get_endpoint_spec(&args_of(&[("param-id", "gear_ratio")])).expect("name"),
+            "gear_ratio"
+        );
 
-        collect_endpoint_entries(&root, "", &mut entries);
-
-        assert!(entries.is_empty());
+        let err = get_endpoint_spec(&args_of(&[])).expect_err("missing endpoint");
+        assert!(err.contains("--endpoint <id|name>"), "{err}");
     }
 }

@@ -137,6 +137,31 @@ int_val = clamp(trunc((float_val - offset) / span * (2^bits - 1)), 0, 2^bits-1)
 
 ---
 
+## 4.1 端点表已改为“连接即加载”（真机验证）
+
+以前 SDK 只带一张 34 项的手工表，读其它端点只能猜类型。现在**添加电机时就把描述符全量读下、解析、缓存**，
+`read-param` / `write-param` 只查缓存表，不再有“表里没有”的分支。真机（slcan0 / fw 0.6.9 / node 1）实测：
+
+| 项 | 结果 |
+|---|---|
+| 连接即加载 | `--mode status` 先打印 `endpoint map: 554 endpoints (521 values), 38433 bytes, VersionCRC=0x3F82` |
+| 描述符成本 | 每次连接约 **2.3 s**（5~6 个续传周期）；`--no-endpoint-map` 下同一条命令 **0.9 s** 且不发任何帧 |
+| 按名字读 | `--mode read-param --endpoint gear_ratio` → `0x00F2 (axis0.motor.config.gear_ratio) declared=float access=rw value=7.75` |
+| 分段 uint64 | `--endpoint serial_number` → `0x0005 declared=uint64 value=108005767394384`（两段拼接） |
+| 窄类型 | `--endpoint 0x008E` → `axis0.current_state declared=uint8 value=1`（不再被猜成 float） |
+| 写保护 | `--mode write-param --endpoint current_state --value 8` → **拒绝**：`declared access="r"`（rc=1，未写入） |
+| 缓存复用 | `--mode find-endpoint` / `--mode endpoint-map --out` 用缓存，输出与独立探针 `tools/cb_json_probe.py` **逐字节一致** |
+| Python | `add_cyberbeast_motor` 约 2.3 s（此时已建表），随后 `cyberbeast_endpoint_map()` 毫秒级返回；不存在的 node 0x09 约 0.5 s 报错 |
+| 静默节点 | 若始终收不到元数据帧则**立即**失败（原重试 64 次≈ 32 s 已改为 1 个静默窗口） |
+
+类型分布（描述符实测）：521 个值 = float 223 / uint32 124 / bool 81 / uint8 47 / int32 21 / uint16 20 / uint64 4 / int64 1，
+另有 26 个 function、6 个 endpoint_ref、1 个 json。
+
+顺带修掉一个缓存 bug：同一端点连读两次时，第二次曾在超时窗口内直接返回上一次的值（C ABI / Python 受影响）；
+现在起始请求会清掉旧值/旧回执/旧形状（有回归用例，把修复注释掉则用例必红）。
+
+---
+
 ## 5. 需要厂商确认的两个“语义边界”（不是 bug，但影响上位机实现）
 
 1. **电机端 vs 输出端**：文档 4.1.1 说明 MIT/POS/VEL 命令为**输出端**单位（固件内部 `× gear_ratio / 2π`），
@@ -167,6 +192,10 @@ sudo slcand -o -c -s8 /dev/ttyACM0 slcan0 && sudo ip link set slcan0 up
 
 # 2) 拉取端点描述符（554 项，含名称/类型/access）
 python3 tools/cb_json_probe.py slcan0 /tmp/endpoints.json
+
+# 2b) SDK 现在连接时就建表，可直接按名字读（无需先拉 JSON）
+motor_cli --vendor cyberbeast --channel slcan0 --motor-id 1 --mode find-endpoint --name gear
+motor_cli --vendor cyberbeast --channel slcan0 --motor-id 1 --mode read-param --endpoint gear_ratio
 
 # 3) 读参数：打印声明类型 + 原始小端字节（可与上位机/odrivetool 对拍）
 motor_cli --vendor cyberbeast --channel slcan0 --motor-id 1 --mode read-param --endpoint 0x0002

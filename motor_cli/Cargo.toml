@@ -22,4 +22,3 @@ motor_vendor_myactuator = { path = "../motor_vendors/myactuator" }
 motor_vendor_hexfellow = { path = "../motor_vendors/hexfellow" }
 motor_vendor_hightorque = { path = "../motor_vendors/hightorque" }
 motor_vendor_cyberbeast = { path = "../motor_vendors/cyberbeast" }
-serde_json = "1"

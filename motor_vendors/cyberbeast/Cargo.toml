@@ -14,6 +14,9 @@ path = "src/lib.rs"
 
 [dependencies]
 motor_core = { path = "../../motor_core" }
+# The device's endpoint descriptor (protocol 4.8) is JSON: parse it with a real
+# parser instead of hand-rolling one.
+serde_json = "1"
 
 [dev-dependencies]
 motor_core = { path = "../../motor_core", features = ["test-support"] }

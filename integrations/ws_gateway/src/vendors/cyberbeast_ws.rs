@@ -23,7 +23,9 @@ pub(crate) fn cmd_scan_cyberbeast(v: &Value, base: &Target) -> Result<Value, Str
 
     let mut found: Vec<Value> = Vec::new();
     for id in start_id..=end_id {
-        let motor = match ctrl.add_motor(id, id, model) {
+        // Probe connection: a scan tries ids that are expected to be silent, so it
+        // must not load each candidate's endpoint descriptor.
+        let motor = match ctrl.add_motor_probe(id, id, model) {
             Ok(m) => m,
             Err(_) => continue,
         };

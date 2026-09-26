@@ -11,14 +11,17 @@
 //! and 0x0019 = `torque_constant`; those guesses are wrong and were removed after
 //! reading the device's own descriptor (see `REGISTER_TABLE`).
 //!
-//! This module provides a minimal static table of **verified** endpoint ids for
-//! documentation and tooling. For the complete map, read the device's own descriptor
-//! at runtime instead of extending this table by hand (protocol 4.8,
-//! `JSON_DESC_READ` 0x24 / `JSON_DESC_DATA` 0x25):
+//! This module provides a static table of **verified** endpoint ids for documentation
+//! and tooling. It is **not** the table the SDK uses at runtime: the device's own
+//! descriptor is loaded when a motor is connected (`CyberBeastController::add_motor`)
+//! and cached on the handle, so `read_param` / `write_param` cover all 554 endpoints of
+//! the tested firmware instead of these entries. To read the map at runtime
+//! (protocol 4.8, `JSON_DESC_READ` 0x24 / `JSON_DESC_DATA` 0x25):
 //!
-//! - Rust: `CyberBeastMotor::read_endpoint_descriptor()` (text) or
-//!   `read_endpoint_descriptor_raw()` (bytes + `TotalLength` + `VersionCRC`)
-//! - CLI: `motor_cli --vendor cyberbeast --channel <ch> --mode endpoint-map --out map.json`
+//! - Rust: `CyberBeastMotor::endpoint_map()` (cached) or `load_endpoint_map(timeout)`
+//!   to re-read it; `read_param_value()` decodes with the declared type
+//! - CLI: `--mode endpoint-map [--out map.json] [--refresh]`, `--mode find-endpoint
+//!   --name <substring>`, and `--endpoint <id|name>` on `read-param` / `write-param`
 //! - Cross-check: `tools/cb_json_probe.py` (raw SocketCAN, no SDK) returns the same JSON
 
 #[derive(Debug, Clone, Copy)]
