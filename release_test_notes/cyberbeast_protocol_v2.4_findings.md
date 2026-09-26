@@ -140,9 +140,14 @@ int_val = clamp(trunc((float_val - offset) / span * (2^bits - 1)), 0, 2^bits-1)
 ## 5. 需要厂商确认的两个“语义边界”（不是 bug，但影响上位机实现）
 
 1. **电机端 vs 输出端**：文档 4.1.1 说明 MIT/POS/VEL 命令为**输出端**单位（固件内部 `× gear_ratio / 2π`），
-   而心跳/`QUERY_POS_VEL` 上报的是**电机端 turns**。SDK 无法从设备读到减速比，
-   因此我们的状态量被明确定义为“**电机端 rad**，不做减速比修正”。
-   请确认：减速比是否有对应端点可读（便于上位机把反馈换算到输出端）？
+   而心跳/`QUERY_POS_VEL` 上报的是**电机端 turns**。
+   **（已解决）** 减速比可从设备自身描述符读到：端点 `axis0.motor.config.gear_ratio` = **0x00F2**
+   （float rw），本机实测 **7.75**（原始字节 `00 00 F8 40`，LE float32）；
+   用 `motor_cli --mode find-endpoint --name gear` 即可查到。
+   SDK 仍把状态量定义为“**电机端 rad**”、不做减速比修正（保证与 `get_param_f32` 等同层读数一致），
+   上位机换算到输出端请除以本值：`output_rad = motor_rad / gear_ratio`。
+   建议文档在 4.1.1 直接写明该端点 id。
+   （该值本身已读实；它是否就是固件换算所用的那个系数，仍需运动实验反解验证。）
 
 2. **ESTOP 的 Dest**：文档 4.9 定义 `Priority = 0 (CRITICAL)`、`Dest = 0xFF`（全局广播），
    并说明收到后进入 IDLE 且**锁存** `ERROR_ESTOP_REQUESTED`。

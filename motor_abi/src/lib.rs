@@ -23,6 +23,9 @@ use std::time::Duration;
 
 thread_local! {
     static LAST_ERROR: RefCell<CString> = RefCell::new(CString::new("ok").expect("static cstring"));
+    /// Holds the last string handed back to the caller (JSON payloads and similar).
+    /// Valid until the next ABI call on the same thread, like `LAST_ERROR`.
+    static LAST_STRING: RefCell<CString> = RefCell::new(CString::new("").expect("static cstring"));
 }
 
 static ABI_CAPABILITIES_JSON: OnceLock<CString> = OnceLock::new();
@@ -44,7 +47,7 @@ const ABI_CAPABILITIES: &str = r#"{
     "myactuator": ["param_i8", "param_u8", "param_u16", "param_u32", "param_f32"],
     "hexfellow": ["socketcanfd", "mit", "pos_vel"],
     "hightorque": ["mit", "vel", "param_i8", "param_u8", "param_u16", "param_u32", "param_f32"],
-    "cyberbeast": ["mit", "pos-vel", "vel", "torque", "estop", "heartbeat", "param_f32"]
+    "cyberbeast": ["mit", "pos-vel", "vel", "torque", "estop", "heartbeat", "param_f32", "endpoint_map"]
   }
 }"#;
 
@@ -64,6 +67,16 @@ fn set_last_error(msg: impl AsRef<str>) {
 
 fn ok_ptr() -> *const c_char {
     LAST_ERROR.with(|slot| slot.borrow().as_ptr())
+}
+
+/// Store a returned string and hand back a pointer to it, mirroring [`set_last_error`].
+fn set_last_string(value: &str) -> *const c_char {
+    let clean = value.replace('\0', " ");
+    let cstr = CString::new(clean).unwrap_or_else(|_| CString::new("").expect("fallback cstring"));
+    LAST_STRING.with(|slot| {
+        *slot.borrow_mut() = cstr;
+        slot.borrow().as_ptr()
+    })
 }
 
 fn to_damiao_mode(mode: u32) -> Result<DamiaoControlMode, &'static str> {

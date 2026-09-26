@@ -79,6 +79,7 @@ fn is_mode_word(s: &str) -> bool {
             | "monitor"
             | "keep-alive"
             | "endpoint-map"
+            | "find-endpoint"
             | "quick-stop"
             | "emergency-stop"
             | "watchdog"
@@ -227,10 +228,11 @@ MyActuator modes:\n\
 Hexfellow modes:\n\
   --mode scan | status | enable | disable | pos-vel | mit\n\n\
 CyberBeast modes:\n\
-  --mode scan | status | mit | pos | vel | torque | enable | disable | estop | clear-error | set-zero | read-param | write-param | endpoint-map | monitor | keep-alive\n\
+  --mode scan | status | mit | pos | vel | torque | enable | disable | estop | clear-error | set-zero | read-param | write-param | endpoint-map | find-endpoint | monitor | keep-alive\n\
   scan and status are query-only: they never send StartMotor/StopMotor.\n\
   monitor is fully passive (no frame is transmitted). keep-alive sends QueryStatus/QueryPosVel only.\n\
   endpoint-map fetches the device's own JSON endpoint descriptor (JSON_DESC_READ 0x24).\n\
+  find-endpoint searches that descriptor by name (--name <substring>).\n\
   estop is a global broadcast (Priority=0, MsgType=0xC0, Dest=0xFF): every device on\n\
   the bus stops and latches an ESTOP error, cleared only by clear-error or a reset.\n\
   set-zero and write-param require --yes.\n\n\
@@ -245,10 +247,12 @@ CyberBeast extras:\n\
   --timeout-ms <ms>    SDO response timeout, default 200 (endpoint-map: stall window, default 500)\n\
   --out <path>         endpoint-map: write the descriptor JSON to this file\n\
   --dump               endpoint-map: also print the descriptor JSON here\n\
+  --name <substring>   find-endpoint: case-insensitive endpoint name filter\n\
   --keep-alive-ms <ms> keep-alive query period, default 500\n\
   --duration-s <s>     run time for monitor/keep-alive, 0 = until Ctrl+C\n\
   position/velocity are motor-side rad (motor turns x 2*pi); MIT/POS/VEL commands\n\
-  carry output-side units, so compare them only when the gear ratio is 1.\n\n\
+  carry output-side units, so divide by the device's gear ratio\n\
+  (axis0.motor.config.gear_ratio, 0x00F2) before comparing with a command target.\n\n\
 \n\
 Common args:\n\
   --transport   auto|socketcan|socketcanfd|dm-serial|dm-device (default auto; dm-serial/dm-device are Damiao-only)\n\

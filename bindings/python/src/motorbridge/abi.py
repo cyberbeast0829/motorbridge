@@ -235,6 +235,13 @@ class Abi:
         lib.motor_handle_cyberbeast_get_param_f32.restype = c_int32
         lib.motor_handle_cyberbeast_write_param_f32.argtypes = [c_void_p, c_uint16, c_float]
         lib.motor_handle_cyberbeast_write_param_f32.restype = c_int32
+        lib.motor_handle_cyberbeast_endpoint_map.argtypes = [
+            c_void_p,
+            c_uint32,
+            POINTER(c_uint32),
+            POINTER(c_uint32),
+        ]
+        lib.motor_handle_cyberbeast_endpoint_map.restype = c_char_p
 
 
 _abi_singleton: Abi | None = None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 
@@ -9,6 +10,58 @@ class EndpointSpec:
     variable: str
     description: str
     value_type: str = ""
+
+
+@dataclass(frozen=True)
+class DescriptorEntry:
+    """One endpoint as reported by the device's own JSON descriptor."""
+
+    name: str
+    endpoint_id: int
+    value_type: str
+    access: str
+
+
+def parse_endpoint_descriptor(json_text: str) -> list[DescriptorEntry]:
+    """Parse a descriptor read with :meth:`Motor.cyberbeast_endpoint_map`.
+
+    Returns every entry that carries an ``id``, in document order, including nested
+    objects (their paths are joined with ``.``). This is the authoritative endpoint
+    list for the connected device; :data:`CYBERBEAST_ENDPOINTS` below only mirrors
+    the endpoints that were verified on firmware 0.6.9.
+    """
+    entries: list[DescriptorEntry] = []
+
+    def walk(node: object, prefix: str) -> None:
+        if isinstance(node, list):
+            for item in node:
+                walk(item, prefix)
+            return
+        if not isinstance(node, dict):
+            return
+        raw_name = node.get("name")
+        name = raw_name if isinstance(raw_name, str) else ""
+        path = f"{prefix}.{name}" if prefix and name else f"{prefix}{name}"
+        endpoint_id = node.get("id")
+        if isinstance(endpoint_id, int) and not isinstance(endpoint_id, bool):
+            value_type = node.get("type")
+            access = node.get("access")
+            entries.append(
+                DescriptorEntry(
+                    name=path,
+                    endpoint_id=endpoint_id,
+                    value_type=value_type if isinstance(value_type, str) else "",
+                    access=access if isinstance(access, str) else "-",
+                )
+            )
+        for key, child in node.items():
+            if key in ("name", "id", "type", "access"):
+                continue
+            if isinstance(child, (dict, list)):
+                walk(child, path)
+
+    walk(json.loads(json_text), "")
+    return entries
 
 
 # Verified CyberBeast SDO endpoint IDs (ODrive/"fibre" endpoint system).
@@ -68,6 +121,12 @@ CYBERBEAST_ENDPOINTS: dict[int, EndpointSpec] = {
         "float r",
     ),
     0x00F1: EndpointSpec(0x00F1, "axis0.motor.config.pole_pairs", "Motor pole pairs", "int32 rw"),
+    0x00F2: EndpointSpec(
+        0x00F2,
+        "axis0.motor.config.gear_ratio",
+        "Gear ratio between motor and output shaft",
+        "float rw",
+    ),
     0x00F3: EndpointSpec(
         0x00F3, "axis0.motor.config.calibration_current", "Calibration current (A)", "float rw"
     ),
@@ -141,6 +200,7 @@ EP_AXIS_CAN_IS_EXTENDED = 0x00B5
 EP_AXIS_CAN_HEARTBEAT_RATE_MS = 0x00B6
 EP_MOTOR_EFFECTIVE_CURRENT_LIM = 0x00CC
 EP_MOTOR_POLE_PAIRS = 0x00F1
+EP_MOTOR_GEAR_RATIO = 0x00F2
 EP_MOTOR_CALIBRATION_CURRENT = 0x00F3
 EP_MOTOR_TORQUE_CONSTANT = 0x00F7
 EP_MOTOR_CURRENT_LIM = 0x00F9

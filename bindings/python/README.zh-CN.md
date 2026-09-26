@@ -129,7 +129,7 @@
   - MyActuator: `add_myactuator_motor(...)`
   - RobStride: `add_robstride_motor(...)`
   - HighTorque: `add_hightorque_motor(...)`
-  - CyberBeast: `add_cyberbeast_motor(...)`（仅经典 CAN；通过 `cyberbeast_get_param_f32(...)` / `cyberbeast_write_param_f32(...)` 访问 SDO 端点）
+  - CyberBeast: `add_cyberbeast_motor(...)`（仅经典 CAN；通过 `cyberbeast_get_param_f32(...)` / `cyberbeast_write_param_f32(...)` 访问 SDO 端点，另有 `cyberbeast_endpoint_map()` 读取设备自报的 JSON 端点描述符）
 - 状态查询统一范式：
   - 推荐统一使用 `request_feedback() -> poll_feedback_once() -> get_state()`。
   - RobStride 私有协议没有单次“请求状态帧”命令；RobStride 的 `request_feedback()` 是非阻塞 no-op。连通性检查请用 `robstride_ping()`，连续状态请用主动上报，需要 新鲜位置/速度请读类型化参数。

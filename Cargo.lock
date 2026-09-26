@@ -278,6 +278,7 @@ dependencies = [
  "motor_vendor_robstride",
  "motor_vendor_robstride_cia402",
  "motor_vendor_robstride_mit",
+ "serde_json",
 ]
 
 [[package]]

@@ -112,6 +112,7 @@ CyberBeast extensions (ODrive SDO endpoints):
 
 - `motor_handle_cyberbeast_get_param_f32(motor, param_id, timeout_ms, out_value)`
 - `motor_handle_cyberbeast_write_param_f32(motor, param_id, value)` (waits for the device write acknowledgment, 200 ms budget)
+- `motor_handle_cyberbeast_endpoint_map(motor, timeout_ms, out_total_len, out_version_crc)` returns the device's own JSON endpoint descriptor (UTF-8; valid until the next ABI call on this thread, NULL on failure). `out_total_len` and `out_version_crc` may be NULL, otherwise they report the descriptor's `TotalLength` / `VersionCRC`. Use it to resolve endpoint ids and value types at runtime instead of hardcoding them. Python: `Motor.cyberbeast_endpoint_map(timeout_ms)` + `motorbridge.cyberbeast_endpoints.parse_endpoint_descriptor()`.
 
 ## Typical Call Flow
 

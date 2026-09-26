@@ -377,6 +377,46 @@ fn unknown_value(bytes: &[u8]) -> String {
     )
 }
 
+/// Walk the descriptor tree and collect `(name, id, type, access)` for nested objects too.
+fn collect_endpoint_entries(
+    value: &serde_json::Value,
+    prefix: &str,
+    out: &mut Vec<(String, u64, String, String)>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let name = map.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let path = if prefix.is_empty() || name.is_empty() {
+                format!("{prefix}{name}")
+            } else {
+                format!("{prefix}.{name}")
+            };
+            if let Some(id) = map.get("id").and_then(|v| v.as_u64()) {
+                let value_type = map
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let access = map.get("access").and_then(|v| v.as_str()).unwrap_or("-");
+                out.push((path.clone(), id, value_type.to_string(), access.to_string()));
+            }
+            for (key, child) in map {
+                if matches!(key.as_str(), "name" | "id" | "type" | "access") {
+                    continue;
+                }
+                if child.is_object() || child.is_array() {
+                    collect_endpoint_entries(child, &path, out);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_endpoint_entries(item, prefix, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn run_cyberbeast(
     args: &HashMap<String, String>,
     channel: &str,
@@ -752,6 +792,34 @@ pub fn run_cyberbeast(
             ctrl.shutdown()?;
         }
 
+        // Read-only: look an endpoint up by name in the device's own descriptor.
+        "find-endpoint" => {
+            let Some(name_filter) = args.get("name") else {
+                return Err("--name <substring> is required for find-endpoint".into());
+            };
+            let filter = name_filter.to_lowercase();
+            let timeout_ms = get_u64(args, "timeout-ms", 500)?;
+            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            let (total_len, version_crc, json) =
+                motor.read_endpoint_descriptor(Duration::from_millis(timeout_ms))?;
+            let root: serde_json::Value = serde_json::from_str(&json)
+                .map_err(|err| format!("descriptor is not valid JSON: {err}"))?;
+            let mut entries = Vec::new();
+            collect_endpoint_entries(&root, "", &mut entries);
+            let mut shown = 0usize;
+            for (name, id, value_type, access) in &entries {
+                if name.to_lowercase().contains(&filter) {
+                    shown += 1;
+                    println!("  id=0x{id:04X} ({id:5}) {value_type:<9} {access:<4} {name}");
+                }
+            }
+            println!(
+                "  {shown} of {} endpoints match \"{name_filter}\" (descriptor {total_len} bytes, VersionCRC=0x{version_crc:04X})",
+                entries.len()
+            );
+            ctrl.shutdown()?;
+        }
+
         // Read-only: fetch the device's own endpoint descriptor (protocol 4.8).
         "endpoint-map" => {
             let motor = ctrl.add_motor(motor_id, motor_id, model)?;
@@ -902,11 +970,72 @@ pub fn run_cyberbeast(
 
         other => {
             eprintln!(
-                "unknown mode: {other}. Supported: scan, status, mit, pos, vel, torque, enable, disable, estop, clear-error, set-zero, read-param, write-param, endpoint-map, monitor, keep-alive"
+                "unknown mode: {other}. Supported: scan, status, mit, pos, vel, torque, enable, disable, estop, clear-error, set-zero, read-param, write-param, endpoint-map, find-endpoint, monitor, keep-alive"
             );
             ctrl.shutdown()?;
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_endpoint_entries_walks_nested_objects() {
+        // Shape mirrors the device descriptor: nested objects carry their own id,
+        // so `find-endpoint` must report the dotted path, not just the leaf name.
+        let json = r#"[
+            {"name":"axis0","id":14,"type":"object","children":[
+                {"name":"config","id":21,"type":"object","children":[
+                    {"name":"node_id","id":180,"type":"uint32","access":"rw"}]},
+                {"name":"current_state","id":142,"type":"uint8","access":"r"}]}]"#;
+        let root: serde_json::Value = serde_json::from_str(json).expect("fixture is valid json");
+        let mut entries = Vec::new();
+
+        collect_endpoint_entries(&root, "", &mut entries);
+
+        assert_eq!(
+            entries,
+            vec![
+                (
+                    "axis0".to_string(),
+                    14,
+                    "object".to_string(),
+                    "-".to_string()
+                ),
+                (
+                    "axis0.config".to_string(),
+                    21,
+                    "object".to_string(),
+                    "-".to_string()
+                ),
+                (
+                    "axis0.config.node_id".to_string(),
+                    180,
+                    "uint32".to_string(),
+                    "rw".to_string()
+                ),
+                (
+                    "axis0.current_state".to_string(),
+                    142,
+                    "uint8".to_string(),
+                    "r".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_endpoint_entries_ignores_objects_without_id() {
+        let root: serde_json::Value =
+            serde_json::from_str(r#"{"name":"meta","children":[{"name":"x"}]}"#).expect("json");
+        let mut entries = Vec::new();
+
+        collect_endpoint_entries(&root, "", &mut entries);
+
+        assert!(entries.is_empty());
+    }
 }

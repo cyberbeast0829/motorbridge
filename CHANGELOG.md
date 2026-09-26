@@ -22,10 +22,18 @@ Versioning.
     `read-param` / `write-param`, `save`, `set-zero`) and `scan`.
   - `bindings/python/examples/cyberbeast_demo.py`.
 - CyberBeast JSON endpoint descriptor access (protocol 4.8):
-  `CyberBeastMotor::read_endpoint_descriptor()` / `read_endpoint_descriptor_raw()` and
-  `motor_cli --mode endpoint-map [--out <path>] [--dump]`, so the device's own
-  endpoint map (554 entries on the tested firmware, 38433 bytes) can be fetched
-  instead of relying on a hand-maintained table.
+  `CyberBeastMotor::read_endpoint_descriptor()` / `read_endpoint_descriptor_raw()`,
+  `motor_cli --mode endpoint-map [--out <path>] [--dump]` and
+  `motor_cli --mode find-endpoint --name <substring>`, plus the ABI entry point
+  `motor_handle_cyberbeast_endpoint_map` exposed to Python as
+  `Motor.cyberbeast_endpoint_map(timeout_ms)` with
+  `motorbridge.cyberbeast_endpoints.parse_endpoint_descriptor()`. The device's own
+  endpoint map (554 entries on the tested firmware, 38433 bytes) can now be read at
+  runtime instead of relying on a hand-maintained table.
+  `motor_cli --mode find-endpoint --name <substring>` also revealed
+  `axis0.motor.config.gear_ratio` (**0x00F2**, float rw, 7.75 on the tested node),
+  so the motor-side vs output-side conversion factor is now readable instead of
+  assumed; both endpoint tables gained it.
 
 ### Fixed
 

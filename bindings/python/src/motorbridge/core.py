@@ -440,6 +440,28 @@ class Motor:
             "cyberbeast_write_param_f32",
         )
 
+    def cyberbeast_endpoint_map(self, timeout_ms: int = 500) -> str:
+        """Read the device's own JSON endpoint descriptor (protocol 4.8).
+
+        Returns the raw JSON text (38433 bytes / 554 endpoints on the tested
+        firmware 0.6.9). Parse it with
+        :func:`motorbridge.cyberbeast_endpoints.parse_endpoint_descriptor` to get
+        every endpoint id, name, value type and access flag. This descriptor is the
+        authoritative map; ``motorbridge.cyberbeast_endpoints.CYBERBEAST_ENDPOINTS``
+        only mirrors the entries that were verified on hardware.
+
+        ``timeout_ms`` is the stall window: the device streams the descriptor and the
+        read continues once no new bytes arrive within it (the ABI enforces a 200 ms
+        floor). Keep a copy of the returned text and compare it with a later call to
+        detect that the device's map changed.
+        """
+        ptr = self._abi.lib.motor_handle_cyberbeast_endpoint_map(
+            self._require_open(), timeout_ms, None, None
+        )
+        if not ptr:
+            raise CallError(f"cyberbeast_endpoint_map failed: {_err_text()}")
+        return ptr.decode("utf-8")
+
     def get_state(self) -> MotorState | None:
         st = CState()
         _ok(self._abi.lib.motor_handle_get_state(self._require_open(), ctypes.byref(st)), "get_state")

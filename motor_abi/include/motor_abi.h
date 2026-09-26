@@ -126,6 +126,12 @@ int32_t motor_handle_damiao_write_param_u32(MotorHandle* motor, uint16_t param_i
 // CyberBeast parameter access (SDO endpoint IDs)
 int32_t motor_handle_cyberbeast_get_param_f32(MotorHandle* motor, uint16_t param_id, uint32_t timeout_ms, float* out_value);
 int32_t motor_handle_cyberbeast_write_param_f32(MotorHandle* motor, uint16_t param_id, float value);
+// Reads the device's own JSON endpoint descriptor (protocol 4.8, JSON_DESC_READ 0x24).
+// On success returns UTF-8 JSON that stays valid until the next ABI call on this thread,
+// or NULL on failure (report it with motor_last_error_message). out_total_len and
+// out_version_crc may be NULL; otherwise they receive the descriptor's TotalLength and
+// VersionCRC, which the caller can use to detect that the endpoint map changed.
+const char* motor_handle_cyberbeast_endpoint_map(MotorHandle* motor, uint32_t timeout_ms, uint32_t* out_total_len, uint32_t* out_version_crc);
 
 #ifdef __cplusplus
 }

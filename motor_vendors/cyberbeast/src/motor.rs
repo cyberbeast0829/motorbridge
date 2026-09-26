@@ -232,7 +232,10 @@ fn mit_current_range_from(mit_max_torque: f32, torque_constant: f32) -> Option<f
 ///
 /// Note: MIT/POS/VEL/TORQUE commands carry **output-side** units (the firmware
 /// applies `× gear_ratio / 2π`), so this motor-side value is only directly
-/// comparable with a command target when the gear ratio is 1.
+/// comparable with a command target after dividing by the gear ratio. That ratio
+/// *is* readable: `axis0.motor.config.gear_ratio` (0x00F2, float rw; 7.75 on the
+/// tested node). This crate deliberately does not apply it, so every value it
+/// reports stays motor-side.
 const MOTOR_TURNS_TO_RAD: f32 = 2.0 * std::f32::consts::PI;
 
 // ============================================================================
@@ -295,13 +298,13 @@ pub struct CyberBeastMotorState {
     pub arbitration_id: u32,
     /// Parsed CAN ID fields.
     pub can_id_parts: CyberBeastCanId,
-    /// Position in radians (output side).
     /// Position in motor-side radians (motor turns × 2π).
     ///
     /// Feedback is reported by the device in motor-side turns (HEARTBEAT,
     /// QUERY_POS_VEL); this struct converts it to radians. Control commands use
-    /// output-side units, so compare against a command target only when the gear
-    /// ratio is 1 (the model catalog carries no gear ratio).
+    /// output-side units, so divide by the device's `gear_ratio`
+    /// (`axis0.motor.config.gear_ratio`, 0x00F2) before comparing with a command
+    /// target; this SDK does not apply that conversion itself.
     pub pos: f32,
     /// Velocity in motor-side rad/s (motor turns/s × 2π). See `pos`.
     pub vel: f32,

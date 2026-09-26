@@ -79,7 +79,8 @@
     ],
     "cyberbeast": [
       "motor_handle_cyberbeast_get_param_f32",
-      "motor_handle_cyberbeast_write_param_f32"
+      "motor_handle_cyberbeast_write_param_f32",
+      "motor_handle_cyberbeast_endpoint_map"
     ]
   },
   "bindings": {
@@ -143,6 +144,7 @@
       "Motor.damiao_write_param_u32(param_id, value)",
       "Motor.cyberbeast_get_param_f32(param_id, timeout_ms)",
       "Motor.cyberbeast_write_param_f32(param_id, value)",
+      "Motor.cyberbeast_endpoint_map(timeout_ms)",
       "Motor.get_state()"
     ],
     "python": {

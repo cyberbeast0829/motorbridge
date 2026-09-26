@@ -163,6 +163,12 @@ pub static REGISTER_TABLE: &[RegisterInfo] = &[
         value_type: "int32 rw",
     },
     RegisterInfo {
+        endpoint_id: 0x00F2,
+        variable: "axis0.motor.config.gear_ratio",
+        description: "Gear ratio between motor and output shaft",
+        value_type: "float rw",
+    },
+    RegisterInfo {
         endpoint_id: 0x00F3,
         variable: "axis0.motor.config.calibration_current",
         description: "Calibration current (A)",

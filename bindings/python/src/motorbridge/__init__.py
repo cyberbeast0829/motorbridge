@@ -2,6 +2,7 @@ from .abi import abi_capabilities, abi_version
 from .core import Controller, Motor
 from .cyberbeast_endpoints import (
     CYBERBEAST_ENDPOINTS,
+    DescriptorEntry,
     EP_AXIS_CAN_HEARTBEAT_RATE_MS,
     EP_AXIS_CAN_IS_EXTENDED,
     EP_AXIS_CAN_NODE_ID,
@@ -29,6 +30,7 @@ from .cyberbeast_endpoints import (
     EP_MOTOR_CALIBRATION_CURRENT,
     EP_MOTOR_CURRENT_LIM,
     EP_MOTOR_EFFECTIVE_CURRENT_LIM,
+    EP_MOTOR_GEAR_RATIO,
     EP_MOTOR_POLE_PAIRS,
     EP_MOTOR_TORQUE_CONSTANT,
     EP_MOTOR_TORQUE_LIM,
@@ -38,6 +40,7 @@ from .cyberbeast_endpoints import (
     EP_ODRV_VBUS_VOLTAGE,
     EndpointSpec,
     get_cyberbeast_endpoint,
+    parse_endpoint_descriptor,
 )
 from .damiao_registers import (
     DAMIAO_HIGH_IMPACT_RIDS,
@@ -104,8 +107,10 @@ __all__ = [
     "MODE_VEL",
     "MODE_FORCE_POS",
     "EndpointSpec",
+    "DescriptorEntry",
     "CYBERBEAST_ENDPOINTS",
     "get_cyberbeast_endpoint",
+    "parse_endpoint_descriptor",
     "EP_AXIS_CURRENT_STATE",
     "EP_AXIS_REQUESTED_STATE",
     "EP_AXIS_WATCHDOG_TIMEOUT",
@@ -124,6 +129,7 @@ __all__ = [
     "EP_CAN_AUTO_BUS_OFF",
     "EP_CAN_AUTO_RETRANSMISSION",
     "EP_MOTOR_EFFECTIVE_CURRENT_LIM",
+    "EP_MOTOR_GEAR_RATIO",
     "EP_MOTOR_POLE_PAIRS",
     "EP_MOTOR_CALIBRATION_CURRENT",
     "EP_MOTOR_TORQUE_CONSTANT",

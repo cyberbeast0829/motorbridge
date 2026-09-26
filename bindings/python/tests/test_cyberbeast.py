@@ -233,6 +233,82 @@ def test_endpoint_names_match_table() -> None:
     assert cyberbeast_endpoints.get_cyberbeast_endpoint(0xFFFF) is None
 
 
+def test_cyberbeast_endpoint_map_returns_descriptor_json(fake_abi) -> None:
+    _, lib = fake_abi(
+        returns={"motor_handle_cyberbeast_endpoint_map": b'{"name":"odrv","id":1}'}
+    )
+    motor = _fake_motor(lib)
+
+    text = motor.cyberbeast_endpoint_map(timeout_ms=750)
+
+    # The ABI returns a pointer (ctypes turns c_char_p into bytes); the length/CRC
+    # out-parameters are optional and the binding does not use them.
+    assert lib.args_of("motor_handle_cyberbeast_endpoint_map") == (0xBEEF, 750, None, None)
+    assert text == '{"name":"odrv","id":1}'
+
+
+def test_cyberbeast_endpoint_map_reports_abi_failure(fake_abi) -> None:
+    _, lib = fake_abi(
+        returns={
+            "motor_handle_cyberbeast_endpoint_map": None,
+            "motor_last_error_message": b"motor is not a CyberBeast motor",
+        }
+    )
+    motor = _fake_motor(lib)
+
+    with pytest.raises(CallError) as excinfo:
+        motor.cyberbeast_endpoint_map()
+
+    assert "cyberbeast_endpoint_map failed" in str(excinfo.value)
+    assert "not a CyberBeast motor" in str(excinfo.value)
+
+
+def test_parse_endpoint_descriptor_walks_nested_objects() -> None:
+    descriptor = json.dumps(
+        [
+            {
+                "name": "axis0",
+                "id": 14,
+                "type": "object",
+                "children": [
+                    {
+                        "name": "config",
+                        "id": 21,
+                        "type": "object",
+                        "children": [
+                            {
+                                "name": "can",
+                                "id": 63,
+                                "type": "object",
+                                "children": [
+                                    {
+                                        "name": "node_id",
+                                        "id": 180,
+                                        "type": "uint32",
+                                        "access": "rw",
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {"name": "current_state", "id": 142, "type": "uint8", "access": "r"},
+                ],
+            }
+        ]
+    )
+
+    entries = cyberbeast_endpoints.parse_endpoint_descriptor(descriptor)
+
+    assert [(e.name, e.endpoint_id, e.value_type, e.access) for e in entries] == [
+        ("axis0", 14, "object", "-"),
+        ("axis0.config", 21, "object", "-"),
+        ("axis0.config.can", 63, "object", "-"),
+        ("axis0.config.can.node_id", 180, "uint32", "rw"),
+        ("axis0.current_state", 142, "uint8", "r"),
+    ]
+    assert cyberbeast_endpoints.parse_endpoint_descriptor("[]") == []
+
+
 # ---------------------------------------------------------------------------
 # API surface parity
 # ---------------------------------------------------------------------------
@@ -247,11 +323,13 @@ def test_api_surface_lists_cyberbeast_entries() -> None:
     assert surface["abi"]["cyberbeast"] == [
         "motor_handle_cyberbeast_get_param_f32",
         "motor_handle_cyberbeast_write_param_f32",
+        "motor_handle_cyberbeast_endpoint_map",
     ]
     assert "cyberbeast" in surface["vendors"]
     assert "Controller.add_cyberbeast_motor(motor_id, feedback_id, model)" in surface["bindings"]["controller_methods"]
     assert "Motor.cyberbeast_get_param_f32(param_id, timeout_ms)" in surface["bindings"]["motor_methods"]
     assert "Motor.cyberbeast_write_param_f32(param_id, value)" in surface["bindings"]["motor_methods"]
+    assert "Motor.cyberbeast_endpoint_map(timeout_ms)" in surface["bindings"]["motor_methods"]
 
 
 def test_api_surface_and_abi_bindings_are_bidirectionally_covered() -> None:
