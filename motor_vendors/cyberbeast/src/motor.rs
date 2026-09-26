@@ -806,6 +806,25 @@ impl CyberBeastMotor {
         self.send_ext(can_id, data)
     }
 
+    /// Send a device reset (`RESET_DEVICE`, 0x64).
+    ///
+    /// The firmware reboots. Configuration and calibration live in Flash and survive --
+    /// verified on the tested node: `gear_ratio`, `current_lim`, the CAN settings and both
+    /// `pre_calibrated` flags are unchanged and the axis comes back ready -- but the
+    /// **position estimate starts again from wherever the axis is at boot**, so positions
+    /// read before the reset are not comparable with the ones after it.
+    ///
+    /// This is the frame that clears a fault which CLEAR_ERRORS (0x65) does not, a latched
+    /// `CAN_BUS_FAILED` (bit 20) from the protocol watchdog among them.
+    ///
+    /// ⚠ Not to be confused with `CONFIG_RESET` (0x23), which **erases the configuration**
+    /// and restores the factory state; that one leaves the axis uncalibrated and needing a
+    /// new calibration.
+    pub fn send_reset_device(&self) -> Result<()> {
+        let can_id = self.cmd_can_id(Priority::Ctrl, MsgType::ResetDevice);
+        self.send_ext(can_id, [0u8; 8])
+    }
+
     /// Send emergency stop.
     ///
     /// Protocol 4.9: ESTOP is a **global broadcast** — `Priority=0 (CRITICAL)`,
@@ -2249,6 +2268,30 @@ mod tests {
         assert_eq!(parts.msg_type, MsgType::MitControl as u8);
         assert_eq!(parts.dest, 0x01);
         assert_eq!(parts.source, DEFAULT_MASTER_ID);
+    }
+
+    #[test]
+    fn test_send_reset_device_uses_the_documented_frame() {
+        let mock_bus = Arc::new(MockBus::new());
+        let bus: Arc<dyn CanBus> = Arc::clone(&mock_bus) as Arc<dyn CanBus>;
+        let motor = CyberBeastMotor::new(0x01, 0x01, "odrive-default", bus).unwrap();
+
+        motor.send_reset_device().unwrap();
+
+        let sent: Vec<CanFrame> = mock_bus.sent.lock().unwrap().drain(..).collect();
+        assert_eq!(sent.len(), 1);
+        let frame = &sent[0];
+        // The firmware ignores system frames at priority <= 2, so this one goes out like
+        // StartMotor/StopMotor (Ctrl = 3), with MsgType 0x64 and an empty payload.
+        let parts = can_id_parts(frame.arbitration_id);
+        assert_eq!(parts.priority, Priority::Ctrl as u8);
+        assert_eq!(parts.msg_type, MsgType::ResetDevice as u8);
+        assert_eq!(MsgType::ResetDevice as u8, 0x64);
+        assert_eq!(parts.dest, 0x01);
+        assert_eq!(parts.source, DEFAULT_MASTER_ID);
+        assert_eq!(frame.data, [0u8; 8]);
+        // The frame that erases the configuration must never be what this sends.
+        assert_ne!(parts.msg_type, MsgType::ConfigReset as u8);
     }
 
     #[test]

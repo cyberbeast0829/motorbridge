@@ -21,6 +21,25 @@ Versioning.
   - Python CLI support: `--vendor cyberbeast` for `run` (all four unified modes,
     `read-param` / `write-param`, `save`, `set-zero`) and `scan`.
   - `bindings/python/examples/cyberbeast_demo.py`.
+- CyberBeast `--mode reset`: sends `RESET_DEVICE` (0x64) after `--yes`, without loading the
+  endpoint map. It is the frame that clears a fault `clear-error` cannot -- a latched
+  `CAN_BUS_FAILED` (bit 20) from the CAN watchdog among them -- and it is deliberately not
+  `CONFIG_RESET` (0x23), which erases the configuration. Configuration and calibration
+  survive the reset; the position estimate starts again from the axis' position at boot.
+- CyberBeast control loops (`mit` / `pos` / `vel` / `torque`) now refuse to start in two
+  cases that used to fail silently, both checked against the device's own endpoint table
+  (skipped with `--no-endpoint-map`, which has no names to resolve): a `--loop-ms` that is
+  not shorter than the device's `can.config.break_timeout` (the CAN protocol watchdog), and
+  an axis with a latched fault (`axis0.error != 0`) -- the firmware refuses closed loop then,
+  so the loop ran and the axis did not move. The messages name the fault bits and the way
+  out. `clear-error` also prints the recovery order now (`break_timeout=0` -> `disable` ->
+  `clear-error`, the order that matters because a clear while the watchdog is still armed is
+  re-latched immediately).
+- Note for CyberBeast users: a non-zero `can.config.break_timeout` arms the CAN watchdog as
+  soon as it is written, and only control frames feed it, so any gap longer than the timeout
+  latches `CAN_BUS_FAILED` (bit 20) -- including the seconds a host spends connecting. Keep
+  it at `0` unless a master feeds it from the start; see `release_test_notes/
+  cyberbeast_protocol_v2.4_findings.md` section 4.3.
 - CyberBeast JSON endpoint descriptor access (protocol 4.8). The device's own table
   is **loaded when a motor is connected** and cached on the handle, so parameter
   access never guesses a value type and never fetches the table on first use:

@@ -253,6 +253,46 @@ MIT 命令 `pos` 为输出端 rad；MIT 响应也是输出端；心跳 / `QUERY_
 
 ---
 
+### 4.3 ⚠ `can.config.break_timeout`：CAN 协议级看门狗（真机验证，2026-09-26）
+
+端点 `can.config.break_timeout`（id **0x0049**，uint16 rw，单位 **ms**；`0` = 超时检测**禁用**，
+不是“100 ms”）。真机（slcan0 / fw 0.6.9 / node 1）实测：
+
+| 场景 | 结果 |
+|---|---|
+| `= 0`，控制帧停发（SIGKILL，未发 StopMotor） | **不动作**：8.3 s 内心跳一直 `axis_state=8`（闭合环）、`errflags=0` ⇒ 主站死了电机**一直通着电**（安全点） |
+| **只写 500 ms，之后不发任何帧**（全新重启、error=0 起步） | **2.5 s 内就锁存** `axis0.error = 0x00100000` ⇒ 修正结论：**武装靠“写入非零值”，不是“收到第一条控制帧”** |
+| 边喂边武装 500 ms，再停发 | **约 0.5 s 触发**（实测 +0.57 s，心跳 100 ms 分辨率）：`axis0.error = 1048576 = 0x00100000`（**bit20 `CAN_BUS_FAILED`**）、心跳 `errflags` bit0(axis)、轴回 IDLE |
+| 谁算“喂狗” | **只有控制类帧**（MIT/POS/VEL/TORQUE）；PARAM_READ / PARAM_WRITE / status 查询都**不算**（实测它们不阻止触发） |
+| 周期 800 ms > 500 ms | **运行中就触发**，且之后控制帧无法重新使能 ⇒ **控制周期必须 < break_timeout** |
+| 锁存后的表现 | 固件**拒绝进闭环**：控制帧照发、循环照跑、进度行照打，**轴一动不动**（实测：`--loop-ms 800` 跑满 6 s、`axis_state=1` IDLE、心跳 `errflags=0x01`）。这是最容易误判成“功能没实现”的一种失败 |
+| 故障清除 | 会**锁存**：`CLEAR_ERRORS(0x65)` 单独用可能清不掉（狗还武装着就清会**立刻重新锁存**）。可用顺序：`break_timeout=0` → `STOP_MOTOR` → `CLEAR_ERRORS`；或 `0x64 RESET_DEVICE` |
+
+**两条容易踩的帧语义**（文档 3.5 表只给了名字）：
+
+| 帧 | 语义 | 代价（实测） |
+|---|---|---|
+| `0x64` **RESET_DEVICE** | 复位设备（重启固件） | 配置/标定**保留**（gear_ratio 7.75、current_lim 40 A、`pre_calibrated` 仍 true、`is_ready` 回 true）；但**位置基准归零**（31.27 → 0 motor turns，轴未动） |
+| `0x23` **CONFIG_RESET** | 擦除配置、恢复出厂并重启 | ⚠ **电机会变成未标定**，必须重新标定 —— 不要用它“复位故障” |
+
+SDK 侧已同步：
+
+* `--mode reset`（0x64，需 `--yes`）：不载端点表、探测连接也不发多余帧，就是发这一帧；用于清不掉故障的场景；
+* 控制类模式（mit/pos/vel/torque）启动前有**两道前置检查**（都只看设备自己的表，`--no-endpoint-map` 时无法解析名字、按文档自动跳过）：
+  1. **周期规则**：`--loop-ms` ≥ `can.config.break_timeout` 直接拒绝，并给出
+     “改小 `--loop-ms` 或 `--mode write-param --endpoint break_timeout --value 0 --yes`” 的指引；
+  2. **锁存故障**：`axis0.error != 0` 直接拒绝（并列出 bit 名与恢复步骤），否则就是上面那条“循环照跑、轴不动”的静默失败；
+  3. 若 `break_timeout` 非零但周期合法，仍会打印一条提示（非零值下本 CLI 连接耗时可能已让设备锁存）；
+* `--mode clear-error` 会补印正确的恢复顺序；
+* `send_reset_device()` 的文档里写明它**不是** `CONFIG_RESET (0x23)`（有断言帧类型 ≠ 0x23 的用例）。
+
+验证用脚本（均未提交）：`cb_break_timeout.sh` / `cb_break_timeout2.sh`（触发时延与慢周期）、
+`cb_followups.sh`（周期规则 5 例 + `--no-endpoint-map` 反例 + 复位模式 + 移动）、
+`cb_t2_diag.sh` + `tools/cb_trip_timing.py`（“写入即武装”的对照实验与逐帧间隔）、
+`cb_fault_guard.sh`（锁存故障下拒绝启动、以及健康轴上真的进闭环）。
+
+---
+
 ## 5. 需要厂商确认的两个“语义边界”（不是 bug，但影响上位机实现）
 
 1. **电机端 vs 输出端**：文档 4.1.1 说明 MIT/POS/VEL 命令为**输出端**单位（固件内部 `× gear_ratio / 2π`），

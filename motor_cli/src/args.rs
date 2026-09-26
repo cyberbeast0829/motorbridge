@@ -228,7 +228,7 @@ MyActuator modes:\n\
 Hexfellow modes:\n\
   --mode scan | status | enable | disable | pos-vel | mit\n\n\
 CyberBeast modes:\n\
-  --mode scan | status | mit | pos | vel | torque | enable | disable | estop | clear-error | set-zero | read-param | write-param | endpoint-map | find-endpoint | monitor | keep-alive\n\
+  --mode scan | status | mit | pos | vel | torque | enable | disable | estop | clear-error | set-zero | reset | read-param | write-param | endpoint-map | find-endpoint | monitor | keep-alive\n\
   scan and status are query-only: they never send StartMotor/StopMotor.\n\
   monitor is fully passive (no frame is transmitted). keep-alive sends QueryStatus/QueryPosVel only.\n\
   endpoint-map fetches the device's own JSON endpoint descriptor (JSON_DESC_READ 0x24).\n\
@@ -237,11 +237,19 @@ CyberBeast modes:\n\
   (bring-up only: parameter reads then fail, and --endpoint takes a numeric id only).\n\
   estop is a global broadcast (Priority=0, MsgType=0xC0, Dest=0xFF): every device on\n\
   the bus stops and latches an ESTOP error, cleared only by clear-error or a reset.\n\
-  set-zero and write-param require --yes.\n\n\
+  set-zero and write-param require --yes.\n\
+  reset (0x64 RESET_DEVICE) reboots the device and also needs --yes; it keeps the\n\
+  configuration and calibration, but the position estimate restarts from the axis'\n\
+  position at boot. It is not the 0x23 CONFIG_RESET, which erases the configuration.\n\
+  mit/pos/vel/torque refuse to start while the axis has a latched fault\n\
+  (axis0.error != 0): the firmware refuses closed loop then, so the loop would run\n\
+  and the axis would not move.\n\n\
 CyberBeast extras:\n\
   --trace              print every TX/RX frame with decoded 29-bit id fields and heartbeat payload\n\
   --tau <float>        alias of --torque for --mode mit\n\
-  --loop-ms <ms>       control loop period, default 5 (mit/torque) or 10 (pos/vel)\n\
+  --loop-ms <ms>       control loop period, default 5 (mit/torque) or 10 (pos/vel);\n\
+                       must be shorter than the device's can.config.break_timeout\n\
+                       (the CAN watchdog, 0 = disabled) or the run is refused\n\
   --vel-limit <rpm>    pos mode velocity limit, default 100\n\
   --cur-limit <A>      pos/vel mode current limit, default 200 (<= 0 means unspecified)\n\
   --endpoint <id|name> read-param/write-param: endpoint id (0x00F2) or a name/path\n\

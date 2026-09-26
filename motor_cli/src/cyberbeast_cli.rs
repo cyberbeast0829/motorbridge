@@ -355,6 +355,143 @@ impl MotorAdder<'_> {
             Ok(self.ctrl.add_motor_probe(motor_id, motor_id, model)?)
         }
     }
+
+    /// Add a motor **without touching the bus**, whatever `--no-endpoint-map` says.
+    ///
+    /// For modes whose whole job is one system frame (`reset`): they need no table, and
+    /// they are exactly what a user reaches for when the node is in a bad state where
+    /// probing it would be pointless.
+    fn add_passive(
+        &self,
+        motor_id: u16,
+        model: &str,
+    ) -> Result<Arc<CyberBeastMotor>, Box<dyn std::error::Error>> {
+        Ok(self.ctrl.add_motor_probe(motor_id, motor_id, model)?)
+    }
+}
+
+/// Does a control loop with this period conflict with the device's CAN watchdog?
+///
+/// `can.config.break_timeout` (u16, ms, `0` = disabled) is the protocol-level timeout: the
+/// device disarms and latches `CAN_BUS_FAILED` (bit 20) about that long after the last
+/// *control* frame, and the axis then stays faulted until the error is cleared. A loop
+/// whose period is not shorter than the timeout therefore cannot work -- it only ever
+/// trips the device. Pure so the rule itself is testable.
+fn watchdog_period_conflict(loop_ms: u64, timeout_ms: u16) -> Option<(u64, u16)> {
+    if timeout_ms == 0 || loop_ms < u64::from(timeout_ms) {
+        return None;
+    }
+    Some((loop_ms, timeout_ms))
+}
+
+/// Names of the axis error bits that change what an operator can do next.
+///
+/// The device's own `err_name` summary collapses several of these into one word, so the raw
+/// word is what gets shown: bit 0 `INVALID_STATE`, bit 11 `WATCHDOG_TIMER_EXPIRED`,
+/// bit 14 `ESTOP_REQUESTED`, bit 20 `CAN_BUS_FAILED` (the CAN protocol watchdog).
+fn axis_error_bits(error: u32) -> String {
+    const BITS: &[(u32, &str)] = &[
+        (1 << 0, "INVALID_STATE"),
+        (1 << 11, "WATCHDOG_TIMER_EXPIRED"),
+        (1 << 14, "ESTOP_REQUESTED"),
+        (1 << 20, "CAN_BUS_FAILED"),
+    ];
+    let names: Vec<&str> = BITS
+        .iter()
+        .filter(|(bit, _)| error & bit != 0)
+        .map(|(_, name)| *name)
+        .collect();
+    if names.is_empty() {
+        "no known bit".to_string()
+    } else {
+        names.join(" + ")
+    }
+}
+
+/// Refuse to start a control loop that cannot work on this device.
+///
+/// Two ways a motion run can look healthy and do nothing:
+///
+/// * the axis has a latched fault. The firmware then refuses to enter closed loop, so the
+///   loop still sends frames and still prints a progress line while the axis sits in IDLE;
+/// * the period is not shorter than `can.config.break_timeout`, the CAN protocol watchdog:
+///   the device disarms and latches `CAN_BUS_FAILED` about that long after the last
+///   *control* frame, so such a loop can only ever trip it.
+///
+/// Best effort by design: a value that cannot be read must not block a control loop -- only
+/// a successful read is enforced. `--no-endpoint-map` has no table to resolve the names in,
+/// so both checks are skipped (the guard cannot see the device's own field names).
+fn check_motion_preconditions(
+    motor: &CyberBeastMotor,
+    loop_ms: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    /// Endpoint names in the device's own table.
+    const ENDPOINT_BREAK_TIMEOUT: &str = "break_timeout";
+    const ENDPOINT_AXIS_ERROR: &str = "axis0.error";
+
+    let Some(map) = motor.endpoint_map() else {
+        return Ok(());
+    };
+    let endpoint_id = |name: &str| map.resolve(name).ok().map(|entry| entry.endpoint_id);
+    let read = |name: &str| {
+        let id = endpoint_id(name)?;
+        let readout = motor
+            .read_param_value(id, Duration::from_millis(PARAM_TIMEOUT_MS))
+            .ok()?;
+        readout.value.as_f64()
+    };
+
+    let timeout_ms = match read(ENDPOINT_BREAK_TIMEOUT) {
+        Some(value) if (0.0..=f64::from(u16::MAX)).contains(&value) => value as u16,
+        _ => return Ok(()),
+    };
+    if let Some((loop_ms, timeout_ms)) = watchdog_period_conflict(loop_ms, timeout_ms) {
+        return Err(format!(
+            "control loop period {loop_ms} ms is not shorter than the device's CAN timeout \
+             (can.config.break_timeout = {timeout_ms} ms): about {timeout_ms} ms after the last \
+             control frame the device disarms and latches CAN_BUS_FAILED (bit 20), and the axis \
+             then stays faulted until `--mode disable` + `--mode clear-error`. Use a smaller \
+             --loop-ms, or turn the device-side timeout off with `--mode write-param --endpoint \
+             break_timeout --value 0 --yes`."
+        )
+        .into());
+    }
+
+    if let Some(error) = read(ENDPOINT_AXIS_ERROR) {
+        let error = error as u32;
+        if error != 0 {
+            let watchdog_hint = if error & (1 << 20) != 0 {
+                " That bit is the CAN protocol watchdog: it is armed as soon as a non-zero \
+                 `can.config.break_timeout` is written -- and by anything else that stops \
+                 feeding it, including this CLI's own connect (it loads the device's endpoint \
+                 map, which takes seconds). Set `break_timeout` to 0 unless a master feeds it \
+                 from the start."
+            } else if error & (1 << 14) != 0 {
+                " An estop is latched hard: `--mode clear-error` cannot always clear it, \
+                 `--mode reset` (or a power cycle) can."
+            } else {
+                ""
+            };
+            return Err(format!(
+                "the axis is faulted (axis0.error = 0x{error:08X}: {}), and while a fault is \
+                 latched the firmware refuses to enter closed loop -- the loop would run and \
+                 the axis would not move. Clear it with `--mode disable` then `--mode \
+                 clear-error` (or `--mode reset`).{watchdog_hint}",
+                axis_error_bits(error)
+            )
+            .into());
+        }
+    }
+
+    if timeout_ms != 0 {
+        println!(
+            "  note: can.config.break_timeout = {timeout_ms} ms is armed; the device disarms and \
+             latches CAN_BUS_FAILED about that long after the last control frame, and this CLI \
+             needs a few seconds to connect, so the axis may already be faulted before the loop \
+             starts (this check reads axis0.error first)"
+        );
+    }
+    Ok(())
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -588,6 +725,8 @@ pub fn run_cyberbeast(
             let target_vel = get_f32(args, "vel", 0.0)?;
             let target_torque = get_torque(args)?;
             let loop_ms = get_u64(args, "loop-ms", 5)?;
+            // A period the device's CAN watchdog cannot be fed by only ever trips it.
+            check_motion_preconditions(&motor, loop_ms)?;
             sigint::install();
             println!(
                 "starting MIT control for motor 0x{motor_id:02X}: pos={target_pos} vel={target_vel} kp={kp} kd={kd} tau={target_torque} loop={loop_ms}ms"
@@ -624,6 +763,7 @@ pub fn run_cyberbeast(
             // Current limit [A]. Default exceeds hardware max so the firmware torque_lim clamp is inert.
             let cur_limit = get_f32(args, "cur-limit", 200.0)?;
             let loop_ms = get_u64(args, "loop-ms", 10)?;
+            check_motion_preconditions(&motor, loop_ms)?;
             sigint::install();
             println!(
                 "starting POS control for motor 0x{motor_id:02X}: pos={target_pos} vel_limit={vel_limit} cur_limit={cur_limit} loop={loop_ms}ms"
@@ -657,6 +797,7 @@ pub fn run_cyberbeast(
             // Current limit [A]. Default exceeds hardware max so the firmware torque_lim clamp is inert.
             let cur_limit = get_f32(args, "cur-limit", 200.0)?;
             let loop_ms = get_u64(args, "loop-ms", 10)?;
+            check_motion_preconditions(&motor, loop_ms)?;
             sigint::install();
             println!(
                 "starting VEL control for motor 0x{motor_id:02X}: vel={target_vel} rpm cur_limit={cur_limit} loop={loop_ms}ms"
@@ -688,6 +829,7 @@ pub fn run_cyberbeast(
             apply_mit_scaling(&motor, PARAM_TIMEOUT_MS);
             let target_torque = get_torque(args)?;
             let loop_ms = get_u64(args, "loop-ms", 5)?;
+            check_motion_preconditions(&motor, loop_ms)?;
             sigint::install();
             println!(
                 "starting TORQUE control for motor 0x{motor_id:02X}: tau={target_torque} loop={loop_ms}ms"
@@ -747,6 +889,27 @@ pub fn run_cyberbeast(
             let motor = adder.add(motor_id, model)?;
             motor.send_clear_errors()?;
             println!("clear-errors (0x65) sent to 0x{motor_id:02X}; re-read status to verify");
+            println!(
+                "  note: a fault that stays latched (a CAN_BUS_FAILED from the protocol watchdog, for example) is cleared in the order `--mode write-param --endpoint break_timeout --value 0 --yes` -> `--mode disable` -> this command; `--mode reset` reboots the device instead"
+            );
+            ctrl.shutdown()?;
+        }
+
+        "reset" => {
+            if !args.contains_key("yes") {
+                return Err(
+                    "reset reboots the device (RESET_DEVICE 0x64, not the 0x23 that erases \
+                            the configuration); re-run with --yes to confirm"
+                        .into(),
+                );
+            }
+            let motor = adder.add_passive(motor_id, model)?;
+            motor.send_reset_device()?;
+            println!("reset (0x64) sent to 0x{motor_id:02X}; the firmware reboots");
+            println!(
+                "  configuration and calibration are kept in Flash, but the position estimate \
+                 starts again from the axis' position at boot"
+            );
             ctrl.shutdown()?;
         }
 
@@ -1104,5 +1267,33 @@ mod tests {
 
         let err = get_endpoint_spec(&args_of(&[])).expect_err("missing endpoint");
         assert!(err.contains("--endpoint <id|name>"), "{err}");
+    }
+
+    #[test]
+    fn watchdog_period_rule_only_fires_when_the_device_would_trip() {
+        // 0 = the device-side timeout detection is disabled, and a loop shorter than the
+        // timeout is fed often enough: neither is a conflict.
+        assert_eq!(watchdog_period_conflict(800, 0), None);
+        assert_eq!(watchdog_period_conflict(5, 500), None);
+        assert_eq!(watchdog_period_conflict(499, 500), None);
+        // Equal counts as too slow: the device trips `CAN_BUS_FAILED` once the gap is
+        // *greater* than the timeout, so a period of exactly the timeout is already late.
+        assert_eq!(watchdog_period_conflict(500, 500), Some((500, 500)));
+        assert_eq!(watchdog_period_conflict(800, 500), Some((800, 500)));
+    }
+
+    #[test]
+    fn axis_error_bits_names_the_bits_an_operator_has_to_act_on() {
+        // The fw 0.6.9 word from the bench: bit 20 is the CAN protocol watchdog.
+        assert_eq!(axis_error_bits(0x0010_0000), "CAN_BUS_FAILED");
+        assert_eq!(axis_error_bits(1 << 14), "ESTOP_REQUESTED");
+        assert_eq!(axis_error_bits(1 << 11), "WATCHDOG_TIMER_EXPIRED");
+        // Several at once are all reported, and an unknown bit must not be dropped
+        // silently -- the hex word is printed next to these names.
+        assert_eq!(
+            axis_error_bits((1 << 20) | (1 << 14)),
+            "ESTOP_REQUESTED + CAN_BUS_FAILED"
+        );
+        assert_eq!(axis_error_bits(1 << 30), "no known bit");
     }
 }
