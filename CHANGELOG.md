@@ -46,8 +46,10 @@ Versioning.
   thing that helps is asking again: `CyberBeastMotor::warm_up` re-sends an idempotent
   `QUERY_POS_VEL` probe until it is answered, counts the re-sends in `tx_retries()`, and
   reports `Timeout` -- never success -- when nothing comes back. The CLI warms up on the
-  `--no-endpoint-map` path (where the mode's own first frame would be the exposed one) and
-  before `--mode reset`; `estop` deliberately skips it. Measured on the bench: with
+  `--no-endpoint-map` path, where the mode's own first frame is the exposed one, and only
+  there: `estop` skips it (a broadcast emergency stop must not wait) and so does
+  `--mode reset` (it is the frame a user sends when the node is in a bad state, so it must
+  not depend on the node answering anything). Measured on the bench: with
   SocketCAN the session's first frame reached the bus in 20/20 runs, and frame loss in
   general is not hypothetical (a lost descriptor frame is what broke one in ten connects
   before the descriptor transfer learned to re-request), so the same "ask again" rule now

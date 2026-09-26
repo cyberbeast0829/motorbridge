@@ -935,10 +935,12 @@ pub fn run_cyberbeast(
                 );
             }
             let motor = adder.add_passive(motor_id, model)?;
-            // `add_passive` deliberately sends nothing, so the one system frame this mode
-            // exists for is still the session's first frame -- warm the link up first, or
-            // a reset that never reached the node would be reported as sent.
-            warm_up_session(&motor);
+            // No warm-up here, and that is deliberate: this is the frame a user reaches for
+            // when the node is in a bad state (`add_passive` exists for exactly that), so it
+            // has to go out at once and must not depend on the node answering anything. A
+            // probe would only delay the reset by half a second when it fails, and it would
+            // still leave the reset's own delivery unconfirmed -- the same reasoning that
+            // made JointSDK keep its estop path off the warm-up.
             motor.send_reset_device()?;
             println!("reset (0x64) sent to 0x{motor_id:02X}; the firmware reboots");
             println!(
