@@ -806,14 +806,40 @@ pub fn encode_param_read_at(endpoint_id: u16, offset: u32) -> [u8; 8] {
     buf
 }
 
-/// Encode a PARAM_WRITE request frame for an ODrive SDO endpoint.
+/// Encode a PARAM_WRITE request frame for an ODrive SDO endpoint (float32 value).
+///
+/// The value goes out **little-endian**, as protocol v2.5 section 4.7 requires: SDO
+/// parameter values are the documented exception to this protocol's big-endian framing.
+/// This encoder sent big-endian until 2026-09-26 -- a leftover from the v2.4 document --
+/// and the firmware stored what it received: writing 100 to
+/// `axis0.config.can.heartbeat_rate_ms` was read back as `1677721600` and silenced the
+/// heartbeat, while the little-endian form restores 100.
 pub fn encode_param_write(endpoint_id: u16, value: f32) -> [u8; 8] {
+    encode_param_write_bytes(endpoint_id, &value.to_le_bytes())
+}
+
+/// Encode a PARAM_WRITE request whose value is `value.len()` bytes wide.
+///
+/// Protocol 4.7: `Flags | EndpointID(u16 BE) | DataLen | value`. The caller passes the
+/// value bytes **in the order the firmware expects** (
+/// [`ParamValue::to_write_bytes`](crate::endpoint_map::ParamValue::to_write_bytes) uses
+/// little-endian) and declares the width, so a one-byte endpoint such as
+/// `axis0.requested_state` can be written with one byte instead of four.
+///
+/// Classic CAN has room for at most 4 value bytes; longer values cannot be written with
+/// this message and are rejected by the caller.
+pub fn encode_param_write_bytes(endpoint_id: u16, value: &[u8]) -> [u8; 8] {
+    debug_assert!(
+        value.len() <= 4,
+        "PARAM_WRITE carries at most 4 value bytes"
+    );
     let mut buf = [0u8; 8];
     buf[0] = 0x00; // flags
     buf[1] = (endpoint_id >> 8) as u8;
     buf[2] = endpoint_id as u8;
-    buf[3] = 0x04; // data_len = 4 (float32)
-    f32_to_big_endian_bytes(value, &mut buf, 4);
+    let len = value.len().min(4);
+    buf[3] = len as u8;
+    buf[4..4 + len].copy_from_slice(&value[..len]);
     buf
 }
 
@@ -822,8 +848,9 @@ pub fn encode_param_write(endpoint_id: u16, value: f32) -> [u8; 8] {
 /// `flags & 0x80` is the **More** flag: the value continues, so the host repeats
 /// the request with `Offset += data_len` and concatenates the chunks.
 ///
-/// Value byte order: protocol 4.7 documents big-endian, but firmware 0.6.9 sends
-/// **little-endian** values. Verified on hardware:
+/// Value byte order: protocol v2.5 section 4.7 states that SDO parameter values are
+/// **little-endian** (the exception to this protocol's big-endian framing) and firmware
+/// 0.6.9 does exactly that. Verified on hardware:
 /// - `vbus_voltage` (0x0002) answers `26 B7 B8 41` = 23.09 V as little-endian
 ///   float32 (big-endian would decode to 4.5e-15)
 /// - `axis0.motor.config.torque_constant` (0x00F7) answers `AF D9 A8 3D` = 0.0824

@@ -1,17 +1,17 @@
-use crate::endpoint_map::{decode_value, EndpointMap, ParamReadout};
+use crate::endpoint_map::{decode_value, EndpointMap, ParamReadout, ParamValue, ValueType};
 use crate::protocol::{
     self, can_id_parts, encode_clear_errors, encode_config_save, encode_current_control,
-    encode_json_desc_read, encode_param_read_at, encode_param_write, encode_pos_control,
-    encode_set_zero, encode_torque_control, encode_vel_control, make_can_id, pack_mit_command,
-    seq_next, unpack_mit_response, CyberBeastCanId, MitCommandParams, MsgType, Priority,
-    ADDR_BROADCAST, DEFAULT_MASTER_ID, MAX_BROADCAST_DEVICES,
+    encode_json_desc_read, encode_param_read_at, encode_pos_control, encode_set_zero,
+    encode_torque_control, encode_vel_control, make_can_id, pack_mit_command, seq_next,
+    unpack_mit_response, CyberBeastCanId, MitCommandParams, MsgType, Priority, ADDR_BROADCAST,
+    DEFAULT_MASTER_ID, MAX_BROADCAST_DEVICES,
 };
 use motor_core::bus::{CanBus, CanFrame};
 use motor_core::device::MotorDevice;
 use motor_core::error::{MotorError, Result};
 use motor_core::model::{ModelCatalog, MotorModelSpec, PvTLimits, StaticModelCatalog};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -200,6 +200,47 @@ const DEFAULT_MIT_KD_LIMIT: f32 = 100.0; // max Kd (N·m·s/rad)
 const DEFAULT_MIT_TORQUE_LIMIT: f32 = 18.0; // ±18 N·m
 const DEFAULT_MIT_CURRENT_LIMIT: f32 = 40.0; // ± A (for response decoding)
 
+/// Ranges that scale the MIT command and response bit fields.
+///
+/// The 16-bit/12-bit MIT fields are relative to the **device's own** maxima, which may
+/// differ from the protocol defaults: the tested node declares `mit_max_pos` 12.5,
+/// `mit_max_vel` 65, `mit_max_torque` 50, `mit_max_kp` 500 and `mit_max_kd` 5. Encoding
+/// with the defaults would send a requested 0.05 N·m as 0.139 N·m and shrink Kd by 20x,
+/// so [`CyberBeastMotor::probe_mit_ranges`] replaces them with the declared values and
+/// [`CyberBeastMotor::send_mit_command`] uses whatever is in force.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MitRanges {
+    pub pos: f32,
+    pub vel: f32,
+    pub kp: f32,
+    pub kd: f32,
+    pub torque: f32,
+}
+
+impl Default for MitRanges {
+    fn default() -> Self {
+        Self {
+            pos: DEFAULT_MIT_POS_LIMIT,
+            vel: DEFAULT_MIT_VEL_LIMIT,
+            kp: DEFAULT_MIT_KP_LIMIT,
+            kd: DEFAULT_MIT_KD_LIMIT,
+            torque: DEFAULT_MIT_TORQUE_LIMIT,
+        }
+    }
+}
+
+impl MitRanges {
+    /// Endpoint names the device uses to declare these maxima, in the order of the
+    /// `MitRanges` fields (pos, vel, kp, kd, torque).
+    const ENDPOINT_NAMES: [&'static str; 5] = [
+        "mit_max_pos",
+        "mit_max_vel",
+        "mit_max_kp",
+        "mit_max_kd",
+        "mit_max_torque",
+    ];
+}
+
 /// Protocol 4.1.2 clamps the MIT response current range at 80 A.
 const MAX_MIT_CURRENT_RANGE_A: f32 = 80.0;
 
@@ -209,6 +250,25 @@ const ENDPOINT_MOTOR_TORQUE_CONSTANT: u16 = 0x00F7;
 
 /// Upper bound on continuation requests for one descriptor transfer.
 const MAX_JSON_DESC_REQUESTS: u32 = 64;
+
+/// Timeout for each MIT-range read when a motor is connected.
+///
+/// Short on purpose: a device that answers does so in milliseconds, and one that does
+/// not must not add full response timeouts to every connect. The probe is best effort --
+/// the documented defaults stay in force and `mit_ranges_note()` explains why -- so the
+/// worst case here is 5 x 150 ms on a device that declares nothing.
+pub(crate) const DEFAULT_MIT_RANGE_PROBE_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// Prefix an error message while keeping the error kind.
+fn with_context(err: MotorError, prefix: &str) -> MotorError {
+    match err {
+        MotorError::InvalidArgument(m) => MotorError::InvalidArgument(format!("{prefix}{m}")),
+        MotorError::Io(m) => MotorError::Io(format!("{prefix}{m}")),
+        MotorError::Timeout(m) => MotorError::Timeout(format!("{prefix}{m}")),
+        MotorError::Protocol(m) => MotorError::Protocol(format!("{prefix}{m}")),
+        MotorError::Unsupported(m) => MotorError::Unsupported(format!("{prefix}{m}")),
+    }
+}
 
 /// MIT response current range: `mit_max_torque / torque_constant`, clamped to 80 A.
 ///
@@ -379,16 +439,23 @@ pub struct CyberBeastMotor {
     /// P/V/T limits derived from model catalog.
     #[allow(dead_code)]
     limits: PvTLimits,
-    /// MIT position limit for encoding (rad).
-    mit_pos_limit: f32,
-    /// MIT velocity limit for encoding (rad/s).
-    mit_vel_limit: f32,
-    /// MIT Kp limit for encoding.
-    mit_kp_limit: f32,
-    /// MIT Kd limit for encoding.
-    mit_kd_limit: f32,
-    /// MIT torque limit for encoding (N·m).
-    pub mit_torque_limit: f32,
+    /// MIT encode/decode ranges.
+    ///
+    /// Protocol defaults until [`Self::probe_mit_ranges`] replaces them with the
+    /// device's declared values (that happens when the motor is connected).
+    mit_ranges: Mutex<MitRanges>,
+    /// Whether `mit_ranges` came from the device (false = protocol defaults).
+    mit_ranges_from_device: AtomicBool,
+    /// Why the device's MIT ranges are not in force, when that happened.
+    mit_ranges_note: Mutex<Option<String>>,
+    /// Gear ratio between motor and output shaft (motor-side = output-side x this).
+    ///
+    /// MIT commands and responses are output-side while every other feedback path is
+    /// motor-side, so this ratio is what keeps [`CyberBeastMotorState`] in one unit.
+    /// 1.0 means "not declared".
+    gear_ratio: AtomicU32,
+    /// Whether `gear_ratio` came from the device.
+    gear_ratio_from_device: AtomicBool,
     /// Current range used to decode the MIT response current field (A).
     ///
     /// Derived from the device (`mit_max_torque / torque_constant`, clamped to
@@ -424,11 +491,11 @@ impl CyberBeastMotor {
             state: Mutex::new(None),
             tx_seq: AtomicU8::new(0),
             limits: PvTLimits::from_spec(spec),
-            mit_pos_limit: DEFAULT_MIT_POS_LIMIT,
-            mit_vel_limit: DEFAULT_MIT_VEL_LIMIT,
-            mit_kp_limit: DEFAULT_MIT_KP_LIMIT,
-            mit_kd_limit: DEFAULT_MIT_KD_LIMIT,
-            mit_torque_limit: DEFAULT_MIT_TORQUE_LIMIT,
+            mit_ranges: Mutex::new(MitRanges::default()),
+            mit_ranges_from_device: AtomicBool::new(false),
+            mit_ranges_note: Mutex::new(None),
+            gear_ratio: AtomicU32::new(1.0f32.to_bits()),
+            gear_ratio_from_device: AtomicBool::new(false),
             mit_current_limit: AtomicU32::new(DEFAULT_MIT_CURRENT_LIMIT.to_bits()),
             param_cache: Mutex::new(ParamCache::new()),
             json_desc: Mutex::new(JsonDescCache::default()),
@@ -518,13 +585,14 @@ impl CyberBeastMotor {
             kd,
             torque,
         };
+        let ranges = self.mit_ranges();
         let data = pack_mit_command(
             &params,
-            self.mit_pos_limit,
-            self.mit_vel_limit,
-            self.mit_kp_limit,
-            self.mit_kd_limit,
-            self.mit_torque_limit,
+            ranges.pos,
+            ranges.vel,
+            ranges.kp,
+            ranges.kd,
+            ranges.torque,
         );
         let can_id = self.cmd_can_id(Priority::HighCtrl, MsgType::MitControl);
         self.send_ext(can_id, data)
@@ -708,16 +776,40 @@ impl CyberBeastMotor {
         self.send_ext(can_id, data)
     }
 
-    /// Send a parameter write request for an ODrive SDO endpoint.
+    /// Send a parameter write request for an ODrive SDO endpoint (float32 value).
     pub fn send_param_write(&self, endpoint_id: u16, value: f32) -> Result<()> {
+        self.send_param_write_bytes(endpoint_id, &value.to_le_bytes())
+    }
+
+    /// Write explicit value bytes to an endpoint.
+    ///
+    /// Escape hatch for firmware quirks: the caller decides the payload (little-endian, as
+    /// the firmware stores it), while the device's table still decides whether the endpoint
+    /// may be written. At most 4 value bytes fit in a classic-CAN frame.
+    pub fn set_param_bytes(&self, endpoint_id: u16, raw: &[u8]) -> Result<()> {
+        if raw.len() > 4 {
+            return Err(MotorError::InvalidArgument(format!(
+                "{} value bytes; a classic-CAN PARAM_WRITE carries at most 4",
+                raw.len()
+            )));
+        }
+        self.check_writable(endpoint_id, None)?;
+        self.send_param_write_bytes(endpoint_id, raw)?;
+        self.wait_for_write_ack(endpoint_id, Duration::from_millis(DEFAULT_PARAM_TIMEOUT_MS))
+    }
+
+    /// Send a PARAM_WRITE request with an explicit value width (big-endian, per protocol 4.7).
+    fn send_param_write_bytes(&self, endpoint_id: u16, value: &[u8]) -> Result<()> {
         {
             let mut cache = self
                 .param_cache
                 .lock()
                 .map_err(|_| MotorError::Io("param cache lock poisoned".into()))?;
             cache.pending_write = Some(endpoint_id);
+            // A fresh write must not be "acknowledged" by the previous write's ack.
+            cache.write_ack_time.remove(&endpoint_id);
         }
-        let data = encode_param_write(endpoint_id, value);
+        let data = protocol::encode_param_write_bytes(endpoint_id, value);
         let can_id = self.cmd_can_id(Priority::Config, MsgType::ParamWrite);
         self.send_ext(can_id, data)
     }
@@ -985,6 +1077,163 @@ impl CyberBeastMotor {
         f32::from_bits(self.mit_current_limit.load(Ordering::Relaxed))
     }
 
+    /// MIT ranges currently used to encode commands and decode responses.
+    pub fn mit_ranges(&self) -> MitRanges {
+        self.mit_ranges
+            .lock()
+            .map(|ranges| *ranges)
+            .unwrap_or_default()
+    }
+
+    /// Whether [`Self::mit_ranges`] came from the device's own declarations.
+    ///
+    /// `false` means the protocol defaults are in force, in which case every MIT field
+    /// is scaled with the wrong denominator; [`Self::mit_ranges_note`] says why.
+    pub fn mit_ranges_from_device(&self) -> bool {
+        self.mit_ranges_from_device.load(Ordering::Relaxed)
+    }
+
+    /// Why the device's MIT ranges are not in force, when the probe did not succeed.
+    pub fn mit_ranges_note(&self) -> Option<String> {
+        self.mit_ranges_note
+            .lock()
+            .ok()
+            .and_then(|note| note.clone())
+    }
+
+    /// The device's torque maximum used to scale MIT commands (N·m).
+    pub fn mit_torque_limit(&self) -> f32 {
+        self.mit_ranges().torque
+    }
+
+    /// Gear ratio between the motor and the output shaft.
+    ///
+    /// Motor-side radians = output-side radians x this. 1.0 means the device did not
+    /// declare one, in which case nothing is scaled (and the MIT response keeps its
+    /// output-side units).
+    pub fn gear_ratio(&self) -> f32 {
+        f32::from_bits(self.gear_ratio.load(Ordering::Relaxed))
+    }
+
+    /// Whether [`Self::gear_ratio`] came from the device.
+    pub fn gear_ratio_from_device(&self) -> bool {
+        self.gear_ratio_from_device.load(Ordering::Relaxed)
+    }
+
+    /// Read the device's gear ratio and use it to convert MIT responses.
+    ///
+    /// Measured on hardware: commanding a 0.1 output rad step moved the motor 0.7506 rad
+    /// while the MIT response settled at 0.0973 output rad, i.e. a ratio of 7.71 against the
+    /// declared 7.75. The endpoint is resolved by name in the loaded map, so the id is not
+    /// hardcoded.
+    pub fn probe_gear_ratio(&self, timeout: Duration) -> Result<f32> {
+        let map = self.endpoint_map().ok_or_else(|| {
+            MotorError::Unsupported(
+                "the endpoint map of this motor is not loaded, so the gear ratio cannot be 
+                 resolved by name"
+                    .to_string(),
+            )
+        })?;
+        let entry = map
+            .resolve("gear_ratio")
+            .map_err(|err| MotorError::Unsupported(format!("gear ratio endpoint: {err}")))?;
+        let readout = self
+            .read_param_value(entry.endpoint_id, timeout)
+            .map_err(|err| {
+                with_context(
+                    err,
+                    &format!(
+                        "gear ratio endpoint \"{}\" (0x{:04X}): ",
+                        entry.path, entry.endpoint_id
+                    ),
+                )
+            })?;
+        let ratio = readout.value.as_f32().ok_or_else(|| {
+            MotorError::Unsupported(format!(
+                "endpoint {} is declared \"{}\", not a float",
+                entry.path, readout.declared
+            ))
+        })?;
+        if !ratio.is_finite() || ratio <= 0.0 {
+            return Err(MotorError::Unsupported(format!(
+                "endpoint {} declares {ratio}, which cannot be a gear ratio",
+                entry.path
+            )));
+        }
+        self.gear_ratio.store(ratio.to_bits(), Ordering::Relaxed);
+        self.gear_ratio_from_device.store(true, Ordering::Relaxed);
+        Ok(ratio)
+    }
+
+    /// Read the device's declared MIT ranges and use them for encoding and decoding.
+    ///
+    /// The MIT bit fields are relative to the device's maxima, so this is what makes a
+    /// commanded torque, velocity or Kd mean what the caller asked for. The endpoints
+    /// are resolved **by name** in the loaded endpoint map (no hardcoded ids) and all
+    /// five have to be declared and usable; otherwise the documented defaults stay in
+    /// force and this returns an error naming the endpoint that failed.
+    pub fn probe_mit_ranges(&self, timeout: Duration) -> Result<MitRanges> {
+        let map = self.endpoint_map().ok_or_else(|| {
+            MotorError::Unsupported(
+                "the endpoint map of this motor is not loaded, so the MIT ranges cannot be 
+                 resolved by name"
+                    .to_string(),
+            )
+        })?;
+        let mut declared = [0f32; MitRanges::ENDPOINT_NAMES.len()];
+        for (index, name) in MitRanges::ENDPOINT_NAMES.iter().enumerate() {
+            let entry = map.resolve(name).map_err(|err| {
+                MotorError::Unsupported(format!("MIT range endpoint \"{name}\": {err}"))
+            })?;
+            let readout = self
+                .read_param_value(entry.endpoint_id, timeout)
+                .map_err(|err| {
+                    with_context(
+                        err,
+                        &format!(
+                            "MIT range endpoint \"{name}\" (0x{:04X}): ",
+                            entry.endpoint_id
+                        ),
+                    )
+                })?;
+            let value = readout.value.as_f32().ok_or_else(|| {
+                MotorError::Unsupported(format!(
+                    "endpoint {name} is declared \"{}\", not a float, so it cannot scale the MIT fields",
+                    readout.declared
+                ))
+            })?;
+            if !value.is_finite() || value <= 0.0 {
+                return Err(MotorError::Unsupported(format!(
+                    "endpoint {name} declares {value}, which cannot scale an MIT field"
+                )));
+            }
+            declared[index] = value;
+        }
+        let ranges = MitRanges {
+            pos: declared[0],
+            vel: declared[1],
+            kp: declared[2],
+            kd: declared[3],
+            torque: declared[4],
+        };
+        if let Ok(mut slot) = self.mit_ranges.lock() {
+            *slot = ranges;
+        }
+        self.mit_ranges_from_device.store(true, Ordering::Relaxed);
+        if let Ok(mut note) = self.mit_ranges_note.lock() {
+            *note = None;
+        }
+        Ok(ranges)
+    }
+
+    /// Keep the documented MIT defaults and record why the device's were not used.
+    pub(crate) fn note_mit_ranges_failure(&self, reason: String) {
+        self.mit_ranges_from_device.store(false, Ordering::Relaxed);
+        if let Ok(mut note) = self.mit_ranges_note.lock() {
+            *note = Some(reason);
+        }
+    }
+
     /// Override the MIT response current range (A) without probing the device.
     pub fn set_mit_current_limit(&self, limit_a: f32) {
         self.mit_current_limit
@@ -1019,10 +1268,93 @@ impl CyberBeastMotor {
         }
     }
 
-    /// Write a parameter value and wait for acknowledgment.
+    /// Write a float32 parameter value and wait for acknowledgment.
+    ///
+    /// When the endpoint map is loaded, the device's own declaration is enforced: a
+    /// four-byte value is no longer sent to a narrower endpoint (use
+    /// [`Self::set_param_value`] for those).
     pub fn set_param_f32(&self, endpoint_id: u16, value: f32) -> Result<()> {
+        self.check_writable(endpoint_id, Some(ValueType::F32))?;
         self.send_param_write(endpoint_id, value)?;
         self.wait_for_write_ack(endpoint_id, Duration::from_millis(DEFAULT_PARAM_TIMEOUT_MS))
+    }
+
+    /// Write a value with the width the device declares for the endpoint.
+    ///
+    /// This is what makes non-float endpoints writable at all: `axis0.requested_state` is
+    /// one byte wide, so it must be written with one value byte. The declared type has to
+    /// match the value, and the endpoint map has to be loaded (connected motors have it),
+    /// because the width comes from the device's own declaration.
+    pub fn set_param_value(&self, endpoint_id: u16, value: ParamValue) -> Result<()> {
+        let declared = self.check_writable(endpoint_id, None)?.ok_or_else(|| {
+            MotorError::Unsupported(
+                "the endpoint map of this motor is not loaded, so the width the device 
+                 declares for this endpoint is unknown; connect through 
+                 CyberBeastController::add_motor or use set_param_f32"
+                    .to_string(),
+            )
+        })?;
+        if !value.matches_type(declared) {
+            return Err(MotorError::InvalidArgument(format!(
+                "endpoint 0x{endpoint_id:04X} is declared \"{}\" but the value to write is {value:?}",
+                declared.label()
+            )));
+        }
+        if declared.byte_width() > 4 {
+            return Err(MotorError::Unsupported(format!(
+                "endpoint 0x{endpoint_id:04X} is declared {} ({} bytes); a classic-CAN 
+                 PARAM_WRITE carries at most 4 value bytes",
+                declared.label(),
+                declared.byte_width()
+            )));
+        }
+        self.send_param_write_bytes(endpoint_id, &value.to_write_bytes())?;
+        self.wait_for_write_ack(endpoint_id, Duration::from_millis(DEFAULT_PARAM_TIMEOUT_MS))
+    }
+
+    /// Check the device's own table for a write when it is loaded.
+    ///
+    /// Returns the declared type (`None` when no map is loaded, which keeps the older
+    /// permissive behaviour for probe handles). Enforces existence, writability and --
+    /// when `expected` is given -- the declared type.
+    fn check_writable(
+        &self,
+        endpoint_id: u16,
+        expected: Option<ValueType>,
+    ) -> Result<Option<ValueType>> {
+        let Some(map) = self.endpoint_map() else {
+            return Ok(None);
+        };
+        let entry = map.get(endpoint_id).ok_or_else(|| {
+            MotorError::InvalidArgument(format!(
+                "endpoint 0x{endpoint_id:04X} ({endpoint_id}) is not in the device's endpoint map ({} entries)",
+                map.len()
+            ))
+        })?;
+        if !entry.access.is_writable() {
+            return Err(MotorError::InvalidArgument(format!(
+                "endpoint 0x{endpoint_id:04X} ({}) is declared access=\"{}\"; refusing to write it",
+                entry.path,
+                entry.access.label()
+            )));
+        }
+        let declared = entry.value_type().ok_or_else(|| {
+            MotorError::Unsupported(format!(
+                "endpoint 0x{endpoint_id:04X} ({}) is declared \"{}\" and cannot be written with PARAM_WRITE",
+                entry.path, entry.raw_type
+            ))
+        })?;
+        if let Some(expected) = expected {
+            if declared != expected {
+                return Err(MotorError::InvalidArgument(format!(
+                    "endpoint 0x{endpoint_id:04X} ({}) is declared \"{}\", not \"{}\"",
+                    entry.path,
+                    declared.label(),
+                    expected.label()
+                )));
+            }
+        }
+        Ok(Some(declared))
     }
 
     /// Store parameters to flash (CONFIG_SAVE).
@@ -1094,12 +1426,17 @@ impl CyberBeastMotor {
         match parts.msg_type {
             // MIT response: reused MIT control msg type from motor → host
             t if t == MsgType::MitControl as u8 => {
+                let ranges = self.mit_ranges();
                 let resp = unpack_mit_response(
                     &frame.data,
-                    self.mit_pos_limit,
-                    self.mit_vel_limit,
+                    ranges.pos,
+                    ranges.vel,
                     self.mit_current_limit(),
                 );
+                // MIT responses carry **output-side** units while the cached state is
+                // motor-side like every other feedback path, so scale by the device's
+                // gear ratio (measured: 0.0973 output rad matched 0.7506 motor rad).
+                let gear = self.gear_ratio();
 
                 let mut state = self
                     .state
@@ -1110,8 +1447,8 @@ impl CyberBeastMotor {
                 state.replace(CyberBeastMotorState {
                     arbitration_id: frame.arbitration_id,
                     can_id_parts: parts,
-                    pos: resp.pos,
-                    vel: resp.vel,
+                    pos: resp.pos * gear,
+                    vel: resp.vel * gear,
                     current: resp.current,
                     error_code: resp.error_code,
                     mode_state: resp.mode_state,

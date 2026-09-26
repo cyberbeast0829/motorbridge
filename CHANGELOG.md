@@ -53,8 +53,8 @@ Versioning.
 
 - CyberBeast fixes found by driving a real node over slcan (1 Mbit/s, fw 0.6.9;
   evidence in `release_test_notes/cyberbeast_protocol_v2.4_findings.md`):
-  - SDO `PARAM_READ` values are decoded as **little-endian** typed values (the
-    protocol document says big-endian; `vbus_voltage` reads 23.09 V only that way).
+  - SDO `PARAM_READ` values are decoded as **little-endian** typed values (protocol v2.5
+    documents this in section 4.7; `vbus_voltage` reads 23.09 V only that way).
     Endpoints that are not 4-byte float32 no longer report a misleading timeout,
     and segmented values (`Flags` bit7 More) are read with `Offset += chunk`, so
     `uint64` endpoints such as `odrv.serial_number` work. `read_param_raw` /
@@ -86,6 +86,27 @@ Versioning.
   - a node that never answers `JSON_DESC_READ` used to retry 64 times (~32 s) before
     giving up; without any descriptor metadata the transfer now fails after one
     quiet window, so a wrong node id is reported in about 500 ms.
+
+Motion-tested fixes (2026-09-26, slcan0, fw 0.6.9, node 1):
+- `START_MOTOR` / `STOP_MOTOR` work now: the firmware ignores system messages at
+  priority <= 2, and the CLI's `enable` mode used to call `shutdown()` -- which sends
+  `StopMotor` -- so `--mode enable` never left the node in closed loop (`current_state`
+  stayed 1). Enabling sticks now (1 -> 8), and only that mode detaches without stopping.
+- The SDO write value was sent **big-endian** (a v2.4-era encoder that was never updated
+  when protocol v2.5 clarified that the values of *both* PARAM_READ and PARAM_WRITE are
+  little-endian). A big-endian write of 100 to `axis0.config.can.heartbeat_rate_ms` was
+  stored as `1677721600` and silenced the heartbeat; the little-endian write restored 100
+  (monitor: 10.00 Hz, 0% loss). Writes now follow both the documented order and the width
+  the device declares, so `axis0.requested_state` (uint8) goes out with one value byte
+  instead of four.
+- The MIT bit fields are scaled by the **device's own** maxima (`mit_max_pos` 12.5,
+  `mit_max_vel` 65, `mit_max_torque` 50, `mit_max_kp` 500, `mit_max_kd` 5), read when the
+  motor is connected. The protocol defaults (12.566 / 30 / 18 / 100) scaled a commanded
+  torque by 50/18 and Kd by 5/100.
+- MIT commands and responses are **output-side** units while the heartbeat and
+  `QUERY_POS_VEL` report motor-side turns, so the response is multiplied by the device's
+  `gear_ratio` (7.75 here; measured 7.71 by moving the axis). Without it the cached
+  `pos`/`vel` changed unit by 7.75x depending on which frame arrived last.
 
 ## [0.4.9] - 2026-07-06
 

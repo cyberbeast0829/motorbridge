@@ -267,9 +267,24 @@ fn pump(
     }
 }
 
-/// Report (and apply) the device's MIT response current range so telemetry is scaled correctly.
-fn apply_mit_current_range(motor: &CyberBeastMotor, timeout_ms: u64) {
-    match motor.probe_mit_current_range(Duration::from_millis(timeout_ms)) {
+/// Report (and apply) the device's own MIT scaling so commands and telemetry mean what they say.
+///
+/// Two independent things are needed: the ranges that scale the MIT bit fields (without
+/// them a commanded torque or Kd is scaled by the protocol defaults instead of the
+/// device's own maxima) and the current range used to decode the MIT response.
+fn apply_mit_scaling(motor: &CyberBeastMotor, timeout_ms: u64) {
+    let timeout = Duration::from_millis(timeout_ms);
+    match motor.probe_mit_ranges(timeout) {
+        Ok(ranges) => println!(
+            "  MIT encode ranges from the device: pos=+/-{} rad, vel=+/-{} rad/s, kp<={}, kd<={}, tau=+/-{} Nm",
+            ranges.pos, ranges.vel, ranges.kp, ranges.kd, ranges.torque
+        ),
+        Err(err) => eprintln!(
+            "  warning: {err}\n           keeping the protocol defaults (pos 12.566, vel 30, kp 500, kd 100, tau 18), \
+             so commanded values will not mean what they say"
+        ),
+    }
+    match motor.probe_mit_current_range(timeout) {
         Ok(range) => println!("  MIT response current range derived from the device: +/-{range} A"),
         Err(err) => eprintln!("  warning: {err}"),
     }
@@ -348,6 +363,57 @@ fn hex_bytes(bytes: &[u8]) -> String {
         .map(|b| format!("{b:02X}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Parse `--raw-bytes` (hex byte pairs, separated by spaces, commas or nothing).
+fn parse_hex_bytes(text: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let digits: String = text
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != ',' && *c != '_')
+        .collect();
+    if digits.is_empty() || !digits.len().is_multiple_of(2) {
+        return Err(format!("--raw-bytes {text} must be whole bytes, e.g. 08 00 00 00").into());
+    }
+    let mut bytes = Vec::with_capacity(digits.len() / 2);
+    for pair in digits.as_bytes().chunks(2) {
+        let pair = std::str::from_utf8(pair)?;
+        bytes.push(
+            u8::from_str_radix(pair, 16)
+                .map_err(|_| format!("--raw-bytes {text}: {pair} is not a hex byte"))?,
+        );
+    }
+    Ok(bytes)
+}
+
+/// Parse `--value` into the type the device declares for the endpoint.
+///
+/// The declaration decides the width: `axis0.requested_state` is a `uint8`, so `8` becomes
+/// one value byte instead of a four-byte float.
+fn parse_param_value(
+    text: &str,
+    declared: ValueType,
+) -> Result<ParamValue, Box<dyn std::error::Error>> {
+    let text = text.trim();
+    let invalid = |what: &str| -> Box<dyn std::error::Error> {
+        format!("--value {text} is not a valid {what}").into()
+    };
+    Ok(match declared {
+        ValueType::F32 => ParamValue::F32(text.parse().map_err(|_| invalid("float"))?),
+        ValueType::F64 => ParamValue::F64(text.parse().map_err(|_| invalid("float64"))?),
+        ValueType::U8 => ParamValue::U8(text.parse().map_err(|_| invalid("uint8"))?),
+        ValueType::U16 => ParamValue::U16(text.parse().map_err(|_| invalid("uint16"))?),
+        ValueType::U32 => ParamValue::U32(text.parse().map_err(|_| invalid("uint32"))?),
+        ValueType::U64 => ParamValue::U64(text.parse().map_err(|_| invalid("uint64"))?),
+        ValueType::I8 => ParamValue::I8(text.parse().map_err(|_| invalid("int8"))?),
+        ValueType::I16 => ParamValue::I16(text.parse().map_err(|_| invalid("int16"))?),
+        ValueType::I32 => ParamValue::I32(text.parse().map_err(|_| invalid("int32"))?),
+        ValueType::I64 => ParamValue::I64(text.parse().map_err(|_| invalid("int64"))?),
+        ValueType::Bool => match text.to_ascii_lowercase().as_str() {
+            "true" | "1" => ParamValue::Bool(true),
+            "false" | "0" => ParamValue::Bool(false),
+            _ => return Err(invalid("bool (true/false/1/0)")),
+        },
+    })
 }
 
 pub fn run_cyberbeast(
@@ -438,6 +504,32 @@ pub fn run_cyberbeast(
                 Some(map) => println!("  endpoint map: {}", map.summary()),
                 None => println!("  endpoint map: not loaded (--no-endpoint-map)"),
             }
+            let ranges = motor.mit_ranges();
+            println!(
+                "  mit-ranges  : pos=+/-{} rad, vel=+/-{} rad/s, kp<={}, kd<={}, tau=+/-{} Nm ({})",
+                ranges.pos,
+                ranges.vel,
+                ranges.kp,
+                ranges.kd,
+                ranges.torque,
+                if motor.mit_ranges_from_device() {
+                    "from the device"
+                } else {
+                    "protocol defaults"
+                }
+            );
+            println!(
+                "  gear-ratio  : {} ({})",
+                motor.gear_ratio(),
+                if motor.gear_ratio_from_device() {
+                    "motor-side rad = output-side rad x this"
+                } else {
+                    "not declared; motor-side and output-side left equal"
+                }
+            );
+            if let Some(note) = motor.mit_ranges_note() {
+                println!("                device ranges unavailable: {note}");
+            }
             let mut snapshot = Snapshot::default();
             let _ = motor.send_query_status();
             pump(&ctrl, &motor, QUERY_TIMEOUT_MS + 100, &mut snapshot);
@@ -489,7 +581,7 @@ pub fn run_cyberbeast(
 
         "mit" => {
             let motor = adder.add(motor_id, model)?;
-            apply_mit_current_range(&motor, PARAM_TIMEOUT_MS);
+            apply_mit_scaling(&motor, PARAM_TIMEOUT_MS);
             let kp = get_f32(args, "kp", 100.0)?;
             let kd = get_f32(args, "kd", 10.0)?;
             let target_pos = get_f32(args, "pos", 0.0)?;
@@ -526,7 +618,7 @@ pub fn run_cyberbeast(
 
         "pos" => {
             let motor = adder.add(motor_id, model)?;
-            apply_mit_current_range(&motor, PARAM_TIMEOUT_MS);
+            apply_mit_scaling(&motor, PARAM_TIMEOUT_MS);
             let target_pos = get_f32(args, "pos", 0.0)?;
             let vel_limit = get_f32(args, "vel-limit", 100.0)?;
             // Current limit [A]. Default exceeds hardware max so the firmware torque_lim clamp is inert.
@@ -560,7 +652,7 @@ pub fn run_cyberbeast(
 
         "vel" => {
             let motor = adder.add(motor_id, model)?;
-            apply_mit_current_range(&motor, PARAM_TIMEOUT_MS);
+            apply_mit_scaling(&motor, PARAM_TIMEOUT_MS);
             let target_vel = get_f32(args, "vel", 0.0)?;
             // Current limit [A]. Default exceeds hardware max so the firmware torque_lim clamp is inert.
             let cur_limit = get_f32(args, "cur-limit", 200.0)?;
@@ -593,7 +685,7 @@ pub fn run_cyberbeast(
 
         "torque" => {
             let motor = adder.add(motor_id, model)?;
-            apply_mit_current_range(&motor, PARAM_TIMEOUT_MS);
+            apply_mit_scaling(&motor, PARAM_TIMEOUT_MS);
             let target_torque = get_torque(args)?;
             let loop_ms = get_u64(args, "loop-ms", 5)?;
             sigint::install();
@@ -625,10 +717,13 @@ pub fn run_cyberbeast(
         "enable" => {
             let motor = adder.add(motor_id, model)?;
             motor.send_start_motor()?;
+            // Detach without stopping: `shutdown()` disables every motor, which undid the
+            // StartMotor that was just sent (that is why this mode never left the axis in
+            // closed loop). Every other mode keeps stopping the axis on exit.
+            ctrl.close_bus()?;
             println!(
-                "enabled motor 0x{motor_id:02X} (StartMotor 0x62 sent; the device stays enabled after this CLI exits)"
+                "enabled motor 0x{motor_id:02X} (StartMotor 0x62 sent, priority 3); the axis stays in closed loop after this CLI exits"
             );
-            ctrl.shutdown()?;
         }
 
         "disable" => {
@@ -693,45 +788,59 @@ pub fn run_cyberbeast(
 
         "write-param" => {
             let spec = get_endpoint_spec(args)?;
-            if !args.contains_key("value") {
-                return Err("--value <float> is required for write-param".into());
+            // `--raw-bytes` sends an explicit payload, so it needs no --value.
+            let raw_value = args.get("value").cloned();
+            if raw_value.is_none() && !args.contains_key("raw-bytes") {
+                return Err("--value <number|true|false> (or --raw-bytes <hex>) is required for write-param".into());
             }
             if !args.contains_key("yes") {
                 return Err(
                     "write-param changes device configuration; re-run with --yes to confirm".into(),
                 );
             }
-            let requested = get_f32(args, "value", 0.0)?;
             let timeout_ms = get_u64(args, "timeout-ms", PARAM_TIMEOUT_MS)?;
             let motor = adder.add(motor_id, model)?;
             let endpoint = resolve_endpoint(&motor, &spec)?;
             let timeout = Duration::from_millis(timeout_ms);
-            // The device's own table decides what may be written: refuse a read-only
-            // endpoint, or one whose value is not a float32, instead of pushing four
-            // bytes into a one-byte endpoint and calling it success.
-            if let Some(map) = motor.endpoint_map() {
-                let entry = map.get(endpoint).ok_or_else(|| {
-                    format!("endpoint 0x{endpoint:04X} is not in the device's endpoint table")
-                })?;
-                if !entry.access.is_writable() {
-                    return Err(format!(
-                        "endpoint 0x{endpoint:04X} ({}) is declared access=\"{}\"; refusing to write it",
-                        entry.path,
-                        entry.access.label()
-                    )
-                    .into());
-                }
-                if entry.value_type() != Some(ValueType::F32) {
-                    return Err(format!(
-                        "endpoint 0x{endpoint:04X} ({}) is declared \"{}\"; write-param writes \
-                         float32 only so far, so this would send a mismatched width",
-                        entry.path, entry.raw_type
-                    )
-                    .into());
-                }
+            // The width and the access flag come from the device's own table: a uint8
+            // endpoint is written with one value byte, and a read-only one is refused.
+            let map = motor.endpoint_map().ok_or(
+                "write-param needs the device's endpoint table: drop --no-endpoint-map so the \
+                 declared value width is known",
+            )?;
+            let entry = map.get(endpoint).ok_or_else(|| {
+                format!("endpoint 0x{endpoint:04X} is not in the device's endpoint table")
+            })?;
+            let declared = entry.value_type().ok_or_else(|| {
+                format!(
+                    "endpoint 0x{endpoint:04X} ({}) is declared \"{}\" and cannot be written",
+                    entry.path, entry.raw_type
+                )
+            })?;
+            // Escape hatch: send exactly these value bytes (little-endian) instead of the
+            // payload the declared type would build. Used to probe firmware quirks such as
+            // whether a narrow endpoint accepts a 1-byte or only a 4-byte value.
+            if let Some(hex) = args.get("raw-bytes") {
+                let bytes = parse_hex_bytes(hex)?;
+                let before = motor.read_param_value(endpoint, timeout).ok();
+                motor.set_param_bytes(endpoint, &bytes)?;
+                let read_back = motor.read_param_value(endpoint, timeout).ok();
+                println!(
+                    "endpoint {}: raw=[{}] before={:?} read_back={:?}",
+                    entry.path,
+                    hex_bytes(&bytes),
+                    before.map(|readout| readout.value.to_string()),
+                    read_back.map(|readout| readout.value.to_string())
+                );
+                println!("  note: explicit byte payload, so compare the read-back yourself");
+                ctrl.shutdown()?;
+                return Ok(());
             }
+
+            let requested =
+                parse_param_value(raw_value.as_deref().ok_or("--value is required")?, declared)?;
             let before = motor.read_param_value(endpoint, timeout).ok();
-            motor.set_param_f32(endpoint, requested)?;
+            motor.set_param_value(endpoint, requested)?;
             let read_back = motor.read_param_value(endpoint, timeout).ok();
             let show = |value: &Option<ParamReadout>| {
                 value
@@ -744,27 +853,30 @@ pub fn run_cyberbeast(
                 .and_then(|readout| readout.path.clone())
                 .unwrap_or_else(|| format!("0x{endpoint:04X}"));
             println!(
-                "endpoint {path}: requested={requested} before={} read_back={}",
+                "endpoint {path}: requested={requested} ({}) before={} read_back={}",
+                declared.label(),
                 show(&before),
                 show(&read_back)
             );
             match read_back.map(|readout| readout.value) {
-                Some(ParamValue::F32(value)) => {
-                    let delta = (value - requested).abs();
-                    if delta <= f32::EPSILON * requested.abs().max(1.0) {
-                        println!("  verified: the device reports the requested value");
+                Some(actual) if actual == requested => {
+                    println!("  verified: the device reports the requested value");
+                }
+                Some(actual) => {
+                    // `requested_state` is consumed by the state machine the moment it is
+                    // written, so it can never read back as itself: say that instead of
+                    // reporting a mismatch, and point at the endpoint that does settle.
+                    if entry.path.ends_with("requested_state") {
+                        println!(
+                            "  note: the device consumed this write before it could be read back \
+                             (it reports {actual}); check its effect through axis0.current_state"
+                        );
                     } else {
                         return Err(format!(
-                            "read-back mismatch on endpoint 0x{endpoint:04X}: requested {requested}, device reports {value} (delta {delta})"
+                            "read-back mismatch on endpoint 0x{endpoint:04X}: requested {requested}, device reports {actual}"
                         )
                         .into());
                     }
-                }
-                Some(other) => {
-                    return Err(format!(
-                        "endpoint 0x{endpoint:04X} read back as {other}, which cannot be compared with {requested}"
-                    )
-                    .into());
                 }
                 None => {
                     return Err(format!(

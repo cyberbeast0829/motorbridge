@@ -246,7 +246,8 @@ CyberBeast extras:\n\
   --cur-limit <A>      pos/vel mode current limit, default 200 (<= 0 means unspecified)\n\
   --endpoint <id|name> read-param/write-param: endpoint id (0x00F2) or a name/path\n\
                        from the device's own table (gear_ratio, axis0.motor.config...)\n\
-  --value <float>      value for write-param; the write is read back and verified\n\
+  --value <number|bool> write-param value, in the type the device declares (float/u8/i32/bool...)\n\
+  --raw-bytes <hex>    write-param: send exactly these value bytes (little-endian)\n\
   --timeout-ms <ms>    SDO response timeout, default 200 (endpoint-map: stall window, default 500)\n\
   --out <path>         endpoint-map: write the descriptor JSON to this file\n\
   --dump               endpoint-map: also print the descriptor JSON here\n\

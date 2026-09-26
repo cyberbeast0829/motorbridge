@@ -1,4 +1,4 @@
-use crate::motor::CyberBeastMotor;
+use crate::motor::{CyberBeastMotor, DEFAULT_MIT_RANGE_PROBE_TIMEOUT};
 use motor_core::bus::{open_can_bus, CanBus};
 use motor_core::error::{MotorError, Result};
 use motor_core::vendor_controller::VendorController;
@@ -57,6 +57,19 @@ impl CyberBeastController {
         motor
             .ensure_endpoint_map(DEFAULT_ENDPOINT_MAP_TIMEOUT)
             .map_err(|err| node_context(err, motor_id))?;
+        // The MIT bit fields are scaled by the device's own maxima, so every MIT command
+        // would be mis-scaled without this. Best effort: a device that does not declare
+        // them keeps the protocol defaults, and `mit_ranges_note()` says why.
+        if let Err(err) = motor.probe_mit_ranges(DEFAULT_MIT_RANGE_PROBE_TIMEOUT) {
+            motor.note_mit_ranges_failure(err.to_string());
+        }
+        // Best effort as well, and only noted when the MIT ranges are fine so a missing
+        // gear ratio cannot hide the more important message.
+        if let Err(err) = motor.probe_gear_ratio(DEFAULT_MIT_RANGE_PROBE_TIMEOUT) {
+            if motor.mit_ranges_from_device() {
+                motor.note_mit_ranges_failure(err.to_string());
+            }
+        }
         Ok(motor)
     }
 
@@ -88,6 +101,14 @@ impl CyberBeastController {
         motor
             .ensure_endpoint_map(DEFAULT_ENDPOINT_MAP_TIMEOUT)
             .map_err(|err| node_context(err, motor_id))?;
+        if let Err(err) = motor.probe_mit_ranges(DEFAULT_MIT_RANGE_PROBE_TIMEOUT) {
+            motor.note_mit_ranges_failure(err.to_string());
+        }
+        if let Err(err) = motor.probe_gear_ratio(DEFAULT_MIT_RANGE_PROBE_TIMEOUT) {
+            if motor.mit_ranges_from_device() {
+                motor.note_mit_ranges_failure(err.to_string());
+            }
+        }
         Ok(motor)
     }
 

@@ -201,6 +201,45 @@ impl ParamValue {
             _ => None,
         }
     }
+
+    /// Whether this value fits the declared type of an endpoint.
+    ///
+    /// Used to refuse a write that would contradict the device's own declaration (a
+    /// four-byte float into a one-byte endpoint, or a `uint8` value into a `bool`).
+    pub fn matches_type(self, value_type: ValueType) -> bool {
+        matches!(
+            (self, value_type),
+            (Self::F32(_), ValueType::F32)
+                | (Self::F64(_), ValueType::F64)
+                | (Self::U8(_), ValueType::U8)
+                | (Self::U16(_), ValueType::U16)
+                | (Self::U32(_), ValueType::U32)
+                | (Self::U64(_), ValueType::U64)
+                | (Self::I8(_), ValueType::I8)
+                | (Self::I16(_), ValueType::I16)
+                | (Self::I32(_), ValueType::I32)
+                | (Self::I64(_), ValueType::I64)
+                | (Self::Bool(_), ValueType::Bool)
+        )
+    }
+
+    /// The value bytes a `PARAM_WRITE` frame carries: little-endian, as protocol v2.5
+    /// section 4.7 requires for SDO parameter values.
+    pub fn to_write_bytes(self) -> Vec<u8> {
+        match self {
+            Self::F32(v) => v.to_le_bytes().to_vec(),
+            Self::F64(v) => v.to_le_bytes().to_vec(),
+            Self::U8(v) => vec![v],
+            Self::U16(v) => v.to_le_bytes().to_vec(),
+            Self::U32(v) => v.to_le_bytes().to_vec(),
+            Self::U64(v) => v.to_le_bytes().to_vec(),
+            Self::I8(v) => vec![v as u8],
+            Self::I16(v) => v.to_le_bytes().to_vec(),
+            Self::I32(v) => v.to_le_bytes().to_vec(),
+            Self::I64(v) => v.to_le_bytes().to_vec(),
+            Self::Bool(v) => vec![u8::from(v)],
+        }
+    }
 }
 
 impl std::fmt::Display for ParamValue {
