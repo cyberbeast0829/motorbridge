@@ -4,6 +4,7 @@ use motor_core::error::Result as MotorResult;
 use motor_vendor_cyberbeast::{
     big_endian_bytes_to_f32, can_id_parts, decode_heartbeat, CyberBeastController, CyberBeastMotor,
     CyberBeastMotorState, ModeState, MsgType, ParamReadout, ParamValue, ValueType,
+    DEFAULT_WARMUP_BUDGET,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -341,6 +342,30 @@ fn resolve_endpoint(
 struct MotorAdder<'a> {
     ctrl: &'a CyberBeastController,
     load_map: bool,
+    /// Warm the session up when the map is **not** loaded.
+    ///
+    /// With the map loaded the first frames of the session are descriptor requests, and
+    /// that transfer already re-requests whatever did not arrive -- so nothing extra is
+    /// needed and the normal path stays byte for byte what it was. Without it the mode's
+    /// own first command would be the one a still-starting adapter drops. `estop` opts
+    /// out: it is a broadcast whose whole point is to go out now.
+    warm_up: bool,
+}
+
+/// Confirm the session's round trip and report what it cost.
+///
+/// Never fatal: a mode that only listens is still useful on a node that does not answer
+/// (and a node that does not answer is exactly what the warning is for), but the failure
+/// is never reported as success either.
+fn warm_up_session(motor: &CyberBeastMotor) {
+    match motor.warm_up(DEFAULT_WARMUP_BUDGET) {
+        Ok(0) => {}
+        Ok(retries) => println!(
+            "  session warm-up: {retries} probe(s) re-sent before the first frame \
+             (the first frame(s) of a session do not always reach the adapter)"
+        ),
+        Err(err) => eprintln!("  warning: {err}"),
+    }
 }
 
 impl MotorAdder<'_> {
@@ -349,11 +374,15 @@ impl MotorAdder<'_> {
         motor_id: u16,
         model: &str,
     ) -> Result<Arc<CyberBeastMotor>, Box<dyn std::error::Error>> {
-        if self.load_map {
-            Ok(self.ctrl.add_motor(motor_id, motor_id, model)?)
+        let motor = if self.load_map {
+            self.ctrl.add_motor(motor_id, motor_id, model)?
         } else {
-            Ok(self.ctrl.add_motor_probe(motor_id, motor_id, model)?)
+            self.ctrl.add_motor_probe(motor_id, motor_id, model)?
+        };
+        if self.warm_up && !self.load_map {
+            warm_up_session(&motor);
         }
+        Ok(motor)
     }
 
     /// Add a motor **without touching the bus**, whatever `--no-endpoint-map` says.
@@ -573,6 +602,8 @@ pub fn run_cyberbeast(
     let adder = MotorAdder {
         ctrl: &ctrl,
         load_map: !args.contains_key("no-endpoint-map"),
+        // A broadcast emergency stop must not wait for a 500 ms warm-up.
+        warm_up: mode != "estop",
     };
     if !adder.load_map {
         eprintln!(
@@ -904,6 +935,10 @@ pub fn run_cyberbeast(
                 );
             }
             let motor = adder.add_passive(motor_id, model)?;
+            // `add_passive` deliberately sends nothing, so the one system frame this mode
+            // exists for is still the session's first frame -- warm the link up first, or
+            // a reset that never reached the node would be reported as sent.
+            warm_up_session(&motor);
             motor.send_reset_device()?;
             println!("reset (0x64) sent to 0x{motor_id:02X}; the firmware reboots");
             println!(
@@ -946,6 +981,13 @@ pub fn run_cyberbeast(
                 readout.value
             );
             println!("  raw little-endian bytes: [{}]", hex_bytes(&readout.raw));
+            if motor.tx_retries() > 0 {
+                println!(
+                    "  {} request(s) re-sent: a frame of this session was lost (the value \
+                     above is the one the device answered last)",
+                    motor.tx_retries()
+                );
+            }
             ctrl.shutdown()?;
         }
 

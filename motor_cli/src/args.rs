@@ -243,7 +243,11 @@ CyberBeast modes:\n\
   position at boot. It is not the 0x23 CONFIG_RESET, which erases the configuration.\n\
   mit/pos/vel/torque refuse to start while the axis has a latched fault\n\
   (axis0.error != 0): the firmware refuses closed loop then, so the loop would run\n\
-  and the axis would not move.\n\n\
+  and the axis would not move.\n\
+  With --no-endpoint-map the session is warmed up before the mode's first frame: an\n\
+  idempotent QUERY_POS_VEL probe is re-sent until it is answered (500 ms budget),\n\
+  because the first frame(s) of a session do not always reach the adapter. estop\n\
+  skips the warm-up (a broadcast emergency stop must not wait).\n\n\
 CyberBeast extras:\n\
   --trace              print every TX/RX frame with decoded 29-bit id fields and heartbeat payload\n\
   --tau <float>        alias of --torque for --mode mit\n\

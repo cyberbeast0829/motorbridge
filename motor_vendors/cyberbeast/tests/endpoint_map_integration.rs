@@ -105,6 +105,18 @@ struct Faults {
     /// Frames pushed before the answer to the next request: residue of a transfer that
     /// was interrupted (a killed or timed-out master).
     residue: Mutex<Vec<CanFrame>>,
+    /// Master frames the node never sees, from the start of the session: `drophead`.
+    ///
+    /// This is the documented slcan behaviour and JointSDK's injected fault of the same
+    /// name: the adapter is still resetting its own input buffer while the host is
+    /// already writing, so the first one or two frames are simply gone -- and Lawicel
+    /// slcan reports nothing per frame, so the host has no signal at all.
+    drophead: Mutex<u32>,
+    /// Which PARAM_READ answer is not delivered (1 = the first), if any: the same loss in
+    /// the other direction, which does produce a request the node saw.
+    drop_param_reply: Mutex<Option<u32>>,
+    /// PARAM_READ answers produced so far (the index `drop_param_reply` counts).
+    param_replies: Mutex<u32>,
 }
 
 impl Faults {
@@ -118,6 +130,14 @@ impl Faults {
 
     fn drop_requests(self: &Arc<Self>, count: u32) {
         *self.drop_requests.lock().expect("fault lock") = count;
+    }
+
+    fn drop_head(self: &Arc<Self>, count: u32) {
+        *self.drophead.lock().expect("fault lock") = count;
+    }
+
+    fn drop_param_reply(self: &Arc<Self>, index: u32) {
+        *self.drop_param_reply.lock().expect("fault lock") = Some(index);
     }
 
     fn push_residue(self: &Arc<Self>, frames: impl IntoIterator<Item = CanFrame>) {
@@ -153,6 +173,20 @@ impl MockDevice {
                 };
                 served += requests.len();
                 for request in requests {
+                    // A frame the adapter dropped in flight: the node never saw it, so
+                    // nothing is answered and the host sees silence only.
+                    let lost_in_flight = {
+                        let mut head = faults.drophead.lock().expect("fault lock");
+                        if *head > 0 {
+                            *head -= 1;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if lost_in_flight {
+                        continue;
+                    }
                     match can_id_parts(request.arbitration_id).msg_type {
                         t if t == MsgType::JsonDescRead as u8 => {
                             // One lock scope per decision: `std::sync::Mutex` is not
@@ -225,6 +259,25 @@ impl MockDevice {
                                 .get(&endpoint_id)
                                 .cloned();
                             if let Some(value) = value {
+                                // The answer may be produced and then lost on the way back.
+                                let reply_index = {
+                                    let mut seen = faults.param_replies.lock().expect("fault lock");
+                                    *seen += 1;
+                                    *seen
+                                };
+                                let answer_lost = {
+                                    let mut plan =
+                                        faults.drop_param_reply.lock().expect("fault lock");
+                                    if *plan == Some(reply_index) {
+                                        *plan = None;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                };
+                                if answer_lost {
+                                    continue;
+                                }
                                 let start = offset.min(value.len());
                                 let end = (start + 4).min(value.len());
                                 mock.push_rx(param_read_frame(
@@ -240,6 +293,15 @@ impl MockDevice {
                             data[1] = request.data[1];
                             data[2] = request.data[2];
                             mock.push_rx(frame(MsgType::ParamWrite, data, 8));
+                        }
+                        // `QUERY_POS_VEL` answers with two big-endian f32 values (turns and
+                        // turns/s). The real node answers this, and it is what the session
+                        // warm-up probes with.
+                        t if t == MsgType::QueryPosVel as u8 => {
+                            let mut data = [0u8; 8];
+                            data[0..4].copy_from_slice(&0.0f32.to_be_bytes());
+                            data[4..8].copy_from_slice(&0.0f32.to_be_bytes());
+                            mock.push_rx(frame(MsgType::QueryPosVel, data, 8));
                         }
                         _ => {}
                     }
@@ -258,6 +320,11 @@ impl MockDevice {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+
+    /// Stop answering while the thread stays alive (the node is there but mute).
+    fn stop_serving(&self) {
+        self.stop.store(true, Ordering::SeqCst);
     }
 }
 
@@ -303,6 +370,16 @@ fn descriptor_requests(mock: &MockBus) -> usize {
         .expect("sent lock")
         .iter()
         .filter(|frame| can_id_parts(frame.arbitration_id).msg_type == MsgType::JsonDescRead as u8)
+        .count()
+}
+
+/// `QUERY_POS_VEL` frames the host sent (the warm-up probe is one of these).
+fn posvel_requests(mock: &MockBus) -> usize {
+    mock.sent
+        .lock()
+        .expect("sent lock")
+        .iter()
+        .filter(|frame| can_id_parts(frame.arbitration_id).msg_type == MsgType::QueryPosVel as u8)
         .count()
 }
 
@@ -371,6 +448,17 @@ impl TestRig {
         self.ctrl
             .add_motor(MOTOR_ID, MOTOR_ID, "odrive-default")
             .expect("connecting loads the endpoint map")
+    }
+
+    /// A handle that sends nothing while it is being created.
+    ///
+    /// For the warm-up checks this matters: with the descriptor in front of it, the
+    /// session's first frame is already a descriptor request, which is why the normal
+    /// connect path never exposes the frame-loss window at all.
+    fn connect_probe(&self) -> Arc<CyberBeastMotor> {
+        self.ctrl
+            .add_motor_probe(MOTOR_ID, MOTOR_ID, "odrive-default")
+            .expect("a probe handle")
     }
 
     fn stop(self) {
@@ -853,5 +941,134 @@ fn residue_from_an_interrupted_transfer_restarts_the_transfer() {
     let baseline = DESCRIPTOR.len().div_ceil(6 * CHUNKS_PER_CYCLE);
     assert_eq!(descriptor_requests(&rig.mock), baseline + 1);
 
+    rig.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Session warm-up and idempotent re-send
+// ---------------------------------------------------------------------------
+//
+// The fault these cover is a dropped frame, not a dropped *answer*: the host's frame (or
+// the device's) never reaches the other side, and with Lawicel slcan nobody is told. The
+// only thing a host can do about it is ask again -- which is exactly what JointSDK's
+// `jsdk_context_warmup` does (`hop` on the slcan HAL: the adapter is still resetting its
+// own input buffer while the host is already writing, so the first one or two frames of a
+// session are simply gone).
+//
+// Note what the *normal* connect path does about it: loading the endpoint descriptor means
+// the session's first frames are descriptor requests, and that transfer already re-requests
+// whatever did not arrive. The warm-up matters for the paths that skip it, and for the
+// transports that open a serial link per session (`dm-device`, `dm-serial`).
+
+#[test]
+fn warm_up_spends_the_dropped_frames_on_probes_instead_of_the_first_command() {
+    for dropped in 1..=3u32 {
+        let faults = Arc::new(Faults::default());
+        faults.drop_head(dropped);
+        let rig = TestRig::start_with_faults(Arc::clone(&faults));
+        // `add_motor_probe` sends nothing, so the warm-up probe really is the session's
+        // first frame -- the position the descriptor load otherwise hides.
+        let motor = rig.connect_probe();
+
+        let retries = motor
+            .warm_up(Duration::from_millis(500))
+            .expect("the probe is re-sent until one lands");
+        assert_eq!(retries, dropped, "one re-send per dropped frame");
+
+        // The point of the exercise: the first command that *matters* now works, and the
+        // value it returns is the device's own.
+        rig.set_param(242, &7.75f32.to_le_bytes());
+        let value = motor
+            .read_param_f32(242, Duration::from_millis(300))
+            .expect("a parameter read after the warm-up");
+        assert_eq!(value, 7.75);
+        assert_eq!(motor.tx_retries(), dropped, "only the warm-up re-sent");
+        rig.stop();
+    }
+}
+
+#[test]
+fn warm_up_is_a_no_op_once_it_has_succeeded() {
+    let rig = TestRig::start();
+    let motor = rig.connect_probe();
+
+    assert_eq!(
+        motor
+            .warm_up(Duration::from_millis(500))
+            .expect("a healthy link"),
+        0
+    );
+    let probes = posvel_requests(&rig.mock);
+    assert_eq!(probes, 1, "one probe is enough on a link that answers");
+
+    assert_eq!(
+        motor
+            .warm_up(Duration::from_millis(500))
+            .expect("already warm"),
+        0
+    );
+    assert_eq!(
+        posvel_requests(&rig.mock),
+        probes,
+        "a warmed session probes nothing again"
+    );
+    rig.stop();
+}
+
+#[test]
+fn a_lost_param_answer_is_asked_again_without_corrupting_the_value() {
+    // The request reached the node; the answer did not come back. One lost frame must not
+    // turn a read into a spurious timeout -- the request is idempotent, so it is sent again.
+    let faults = Arc::new(Faults::default());
+    faults.drop_param_reply(1);
+    let rig = TestRig::start_with_faults(Arc::clone(&faults));
+    rig.set_param(242, &7.75f32.to_le_bytes());
+    let motor = rig.connect();
+
+    let value = motor
+        .read_param_f32(242, Duration::from_millis(600))
+        .expect("the read is re-sent after the lost answer");
+    assert_eq!(value, 7.75);
+    assert!(motor.tx_retries() >= 1, "and the retry is reported");
+    rig.stop();
+}
+
+#[test]
+fn a_lost_continuation_answer_is_asked_again_at_the_same_offset() {
+    // `serial_number` is a uint64, so the read takes two cycles. The second answer is lost:
+    // nothing arrives for the offset that is outstanding, so the host asks for that same
+    // offset again and the assembled value is still exactly the device's.
+    let faults = Arc::new(Faults::default());
+    faults.drop_param_reply(2);
+    let rig = TestRig::start_with_faults(Arc::clone(&faults));
+    rig.set_param(5, &0x0123_4567_89AB_CDEFu64.to_le_bytes());
+    let motor = rig.connect();
+
+    let bytes = motor
+        .read_param_raw(5, Duration::from_millis(600))
+        .expect("the outstanding offset is asked for again");
+    assert_eq!(bytes, 0x0123_4567_89AB_CDEFu64.to_le_bytes());
+    assert!(motor.tx_retries() >= 1, "and the retry is reported");
+    rig.stop();
+}
+
+#[test]
+fn a_segmented_read_that_never_gets_an_answer_times_out_without_inventing_bytes() {
+    // The counterpart of the test above: when the node stops answering altogether, the read
+    // must report the timeout -- never a half assembled value that looks like a real one.
+    let faults = Arc::new(Faults::default());
+    faults.drop_param_reply(1);
+    let rig = TestRig::start_with_faults(Arc::clone(&faults));
+    rig.set_param(5, &0x0123_4567_89AB_CDEFu64.to_le_bytes());
+    let motor = rig.connect();
+    // Stop the node before the read, so nothing can answer.
+    rig.device.stop_serving();
+
+    let err = motor
+        .read_param_raw(5, Duration::from_millis(300))
+        .expect_err("a silent node must not produce a value")
+        .to_string();
+    assert!(err.contains("timeout waiting for param read"), "{err}");
+    assert!(err.contains("0x0005"), "{err}");
     rig.stop();
 }

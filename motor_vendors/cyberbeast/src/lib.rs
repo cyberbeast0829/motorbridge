@@ -9,7 +9,10 @@ pub use endpoint_map::{
     decode_value, Access, EndpointEntry, EndpointKind, EndpointMap, ParamReadout, ParamValue,
     ValueType,
 };
-pub use motor::{model_limits, ControlMode, CyberBeastMotor, CyberBeastMotorState, MitRanges};
+pub use motor::{
+    model_limits, ControlMode, CyberBeastMotor, CyberBeastMotorState, MitRanges,
+    DEFAULT_WARMUP_BUDGET, WARMUP_ATTEMPT,
+};
 pub use protocol::{
     big_endian_bytes_to_f32, can_id_parts, decode_device_info_response, decode_heartbeat,
     decode_param_read_frame, decode_param_read_response, encode_config_reset, encode_config_save,

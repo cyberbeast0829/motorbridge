@@ -40,6 +40,19 @@ Versioning.
   latches `CAN_BUS_FAILED` (bit 20) -- including the seconds a host spends connecting. Keep
   it at `0` unless a master feeds it from the start; see `release_test_notes/
   cyberbeast_protocol_v2.4_findings.md` section 4.3.
+- CyberBeast sessions now warm up before sending anything that matters. A host that opens a
+  serial link to an adapter can lose the first frame(s) it writes (the adapter is still
+  resetting its own input buffer) and Lawicel slcan reports nothing per frame, so the only
+  thing that helps is asking again: `CyberBeastMotor::warm_up` re-sends an idempotent
+  `QUERY_POS_VEL` probe until it is answered, counts the re-sends in `tx_retries()`, and
+  reports `Timeout` -- never success -- when nothing comes back. The CLI warms up on the
+  `--no-endpoint-map` path (where the mode's own first frame would be the exposed one) and
+  before `--mode reset`; `estop` deliberately skips it. Measured on the bench: with
+  SocketCAN the session's first frame reached the bus in 20/20 runs, and frame loss in
+  general is not hypothetical (a lost descriptor frame is what broke one in ten connects
+  before the descriptor transfer learned to re-request), so the same "ask again" rule now
+  covers parameter reads too: an unanswered `PARAM_READ` is re-sent inside the caller's
+  timeout instead of failing on one lost frame, and the count is reported by `read-param`.
 - CyberBeast JSON endpoint descriptor access (protocol 4.8). The device's own table
   is **loaded when a motor is connected** and cached on the handle, so parameter
   access never guesses a value type and never fetches the table on first use:

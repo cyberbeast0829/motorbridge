@@ -85,6 +85,30 @@ pub enum ControlMode {
 const DEFAULT_PARAM_TIMEOUT_MS: u64 = 200;
 const PARAM_POLL_INTERVAL_MS: u64 = 2;
 
+/// How long a session warm-up keeps probing before it reports that nothing answers
+/// (see [`CyberBeastMotor::warm_up`]).
+pub const DEFAULT_WARMUP_BUDGET: Duration = Duration::from_millis(500);
+
+/// What one warm-up probe waits for its answer before it is re-sent.
+///
+/// Deliberately small: on a healthy link one round trip takes a millisecond or two, and
+/// when a frame was *lost* waiting longer cannot help -- only re-sending can. A longer
+/// window would only make the failure slower to report.
+pub const WARMUP_ATTEMPT: Duration = Duration::from_millis(50);
+
+/// How long an idempotent read waits before it assumes its request (or the answer) was
+/// lost and asks again, within the caller's own timeout.
+const READ_RETRY_AFTER: Duration = Duration::from_millis(50);
+
+/// How many probes a warm-up budget allows, plus two rounds for the attempt window.
+///
+/// Pure so the arithmetic is testable -- including the point of the extra cap: a clock
+/// that does not advance must not turn the probe loop into a spin.
+fn warmup_attempt_cap(budget: Duration, attempt: Duration) -> u32 {
+    let per_attempt_ms = attempt.as_millis().max(1);
+    (budget.as_millis() / per_attempt_ms).min(u128::from(u32::MAX - 2)) as u32 + 2
+}
+
 #[derive(Debug, Clone)]
 struct ParamCache {
     /// Cached float values keyed by endpoint_id.
@@ -602,6 +626,19 @@ pub struct CyberBeastMotor {
     ///
     /// Kept in an `Arc` so readers can use the table without holding the lock.
     endpoint_map: Mutex<Option<Arc<EndpointMap>>>,
+    /// The last frame that answered one of **our** requests: `(msg type, when)`.
+    ///
+    /// Unsolicited heartbeats are deliberately left out. A heartbeat proves the receive
+    /// path works and says nothing about the transmit path, and the transmit path is what
+    /// an adapter at the far end of a serial link drops while it is still starting up --
+    /// the whole point of [`CyberBeastMotor::warm_up`].
+    last_response: Mutex<Option<(u8, Instant)>>,
+    /// Set once a session warm-up succeeded: later calls are no-ops.
+    warmed: AtomicBool,
+    /// Requests the host had to send again because nothing came back (warm-up probes plus
+    /// idempotent reads). Non-zero means the link dropped a frame -- worth seeing, because
+    /// it costs one round trip and changes nothing else.
+    tx_retries: AtomicU32,
 }
 
 impl CyberBeastMotor {
@@ -632,6 +669,9 @@ impl CyberBeastMotor {
             param_cache: Mutex::new(ParamCache::new()),
             json_desc: Mutex::new(JsonDescCache::default()),
             endpoint_map: Mutex::new(None),
+            last_response: Mutex::new(None),
+            warmed: AtomicBool::new(false),
+            tx_retries: AtomicU32::new(0),
         })
     }
 
@@ -646,6 +686,111 @@ impl CyberBeastMotor {
 
     pub fn latest_state(&self) -> Option<CyberBeastMotorState> {
         self.state.lock().ok().and_then(|s| *s)
+    }
+
+    /// Requests this session had to send again because nothing came back.
+    pub fn tx_retries(&self) -> u32 {
+        self.tx_retries.load(Ordering::Relaxed)
+    }
+
+    /// Remember that the node answered one of our requests.
+    ///
+    /// Heartbeats are filtered out on purpose: they arrive whether or not the device ever
+    /// saw our frames, so they cannot be used to conclude that a round trip worked.
+    fn record_response(&self, msg_type: u8) {
+        if msg_type == MsgType::Heartbeat as u8 {
+            return;
+        }
+        if let Ok(mut last) = self.last_response.lock() {
+            *last = Some((msg_type, Instant::now()));
+        }
+    }
+
+    /// Whether a response of this message type arrived at or after `since`.
+    fn answered_since(&self, msg_type: u8, since: Instant) -> bool {
+        self.last_response
+            .lock()
+            .map(|last| matches!(*last, Some((kind, when)) if kind == msg_type && when >= since))
+            .unwrap_or(false)
+    }
+
+    /// Whether a PARAM_READ answer for this endpoint arrived at or after `since`.
+    fn param_answer_since(&self, endpoint_id: u16, since: Instant) -> bool {
+        self.param_cache
+            .lock()
+            .map(|cache| {
+                cache
+                    .shapes
+                    .get(&endpoint_id)
+                    .map(|(_, _, when)| *when >= since)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Confirm that a round trip to this node works, re-sending an idempotent request
+    /// until it does.
+    ///
+    /// **Why this exists.** A host that opens a serial link to the adapter can lose the
+    /// first one or two frames it writes -- the adapter is still resetting its own input
+    /// buffer -- and Lawicel slcan reports nothing per frame, so the host sees only "the
+    /// command timed out" and a second attempt that works. Waiting longer cannot help;
+    /// re-sending can. JointSDK measured exactly this on its own slcan HAL and added the
+    /// same probe (`jsdk_context_warmup`).
+    ///
+    /// **How far it is verified here.** motorbridge's CyberBeast path goes through
+    /// SocketCAN, where `slcand` owns the serial port instead of the session, and 20/20
+    /// runs of `--mode status --no-endpoint-map` on the bench got the session's *first*
+    /// frame onto the bus. So on that bench this probe is insurance rather than a repair
+    /// (the transports that do open a USB serial link per session are `dm-device` and
+    /// `dm-serial`). Frame loss itself is not hypothetical: a single lost descriptor frame
+    /// is what made roughly one in ten connects fail before
+    /// [`Self::read_endpoint_descriptor_raw`] learned to re-request the missing offset.
+    ///
+    /// Contract:
+    /// * idempotent and side-effect free -- the probe is a `QUERY_POS_VEL` read;
+    /// * a no-op once it has succeeded in this session;
+    /// * bounded by both the budget and a probe count, so a clock that does not advance
+    ///   cannot make it spin;
+    /// * `Err(Timeout)` means only "nothing came back", which a passive mode may still be
+    ///   fine with -- but it is never reported as success.
+    ///
+    /// Returns how many probes had to be re-sent (0 = the first one was answered).
+    pub fn warm_up(&self, budget: Duration) -> Result<u32> {
+        if self.warmed.load(Ordering::Relaxed) {
+            return Ok(0);
+        }
+        let budget = if budget.is_zero() {
+            DEFAULT_WARMUP_BUDGET
+        } else {
+            budget
+        };
+        let cap = warmup_attempt_cap(budget, WARMUP_ATTEMPT);
+        let started = Instant::now();
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            let asked_at = Instant::now();
+            self.send_query_pos_vel()?;
+            while asked_at.elapsed() < WARMUP_ATTEMPT {
+                if self.answered_since(MsgType::QueryPosVel as u8, asked_at) {
+                    self.warmed.store(true, Ordering::Relaxed);
+                    self.tx_retries.fetch_add(attempts - 1, Ordering::Relaxed);
+                    return Ok(attempts - 1);
+                }
+                std::thread::sleep(Duration::from_millis(PARAM_POLL_INTERVAL_MS));
+            }
+            if attempts >= cap || started.elapsed() + WARMUP_ATTEMPT >= budget {
+                self.tx_retries.fetch_add(attempts - 1, Ordering::Relaxed);
+                return Err(MotorError::Timeout(format!(
+                    "session warm-up: node 0x{:02X} did not answer {} QUERY_POS_VEL probes \
+                     (budget {budget:?}, {WARMUP_ATTEMPT:?} per probe) -- the bus is open but \
+                     nothing came back; check the adapter and the wiring (a first frame lost \
+                     while an adapter was still starting up looks exactly like this)",
+                    self.motor_id, attempts
+                )));
+            }
+        }
     }
 
     /// Get or compute the next transmit sequence number.
@@ -1006,9 +1151,15 @@ impl CyberBeastMotor {
     ///
     /// Unlike [`Self::get_param_f32`] this sends the first request itself, so it can
     /// read any value width (uint8/uint16/uint32/uint64/float32/float64).
+    ///
+    /// The request is **idempotent**, so a request that goes unanswered for
+    /// [`READ_RETRY_AFTER`] is sent again (still inside `timeout`) instead of failing on a
+    /// single lost frame. That is the robustness the descriptor transfer already had: a
+    /// dropped frame on this bus used to surface as a spurious timeout.
     pub fn read_param_raw(&self, endpoint_id: u16, timeout: Duration) -> Result<Vec<u8>> {
         let deadline = Instant::now() + timeout;
         let mut requested_offset = 0usize;
+        let mut asked_at = Instant::now();
         self.send_param_read(endpoint_id)?;
         loop {
             let snapshot = {
@@ -1028,6 +1179,7 @@ impl CyberBeastMotor {
                 }
                 if bytes.len() > requested_offset {
                     requested_offset = bytes.len();
+                    asked_at = Instant::now();
                     self.send_param_read_at(endpoint_id, requested_offset as u32)?;
                 }
             }
@@ -1035,6 +1187,17 @@ impl CyberBeastMotor {
                 return Err(MotorError::Timeout(format!(
                     "timeout waiting for param read 0x{endpoint_id:04X}",
                 )));
+            }
+            // Only re-ask while *nothing* has come back for the current offset. A repeat
+            // of an already assembled chunk cannot be told apart from the next one (the
+            // response carries no offset), so re-asking mid-transfer could corrupt the
+            // value -- the one thing worse than reporting the timeout.
+            if asked_at.elapsed() >= READ_RETRY_AFTER
+                && !self.param_answer_since(endpoint_id, asked_at)
+            {
+                self.tx_retries.fetch_add(1, Ordering::Relaxed);
+                asked_at = Instant::now();
+                self.send_param_read_at(endpoint_id, requested_offset as u32)?;
             }
             std::thread::sleep(Duration::from_millis(PARAM_POLL_INTERVAL_MS));
         }
@@ -1671,6 +1834,9 @@ impl CyberBeastMotor {
     /// Process an incoming frame: decode MIT response, heartbeat, or other feedback.
     fn process_feedback_frame_impl(&self, frame: CanFrame) -> Result<()> {
         let parts = can_id_parts(frame.arbitration_id);
+        // Answers to our own requests are remembered separately from heartbeats; the
+        // session warm-up reads this back (see `record_response`).
+        self.record_response(parts.msg_type);
 
         match parts.msg_type {
             // MIT response: reused MIT control msg type from motor → host
@@ -2147,8 +2313,130 @@ mod tests {
     use std::sync::Arc;
 
     fn make_motor() -> CyberBeastMotor {
-        let bus: Arc<dyn CanBus> = Arc::new(MockBus::new());
-        CyberBeastMotor::new(0x01, 0x01, "odrive-default", bus).unwrap()
+        mock_motor().1
+    }
+
+    /// A motor plus the bus behind it, so a test can both inspect what was sent and
+    /// inject frames the way the device would.
+    fn mock_motor() -> (Arc<MockBus>, CyberBeastMotor) {
+        let mock: Arc<MockBus> = Arc::new(MockBus::new());
+        let bus: Arc<dyn CanBus> = Arc::clone(&mock) as Arc<dyn CanBus>;
+        let motor = CyberBeastMotor::new(0x01, 0x01, "odrive-default", bus).unwrap();
+        (mock, motor)
+    }
+
+    fn probes_sent(mock: &MockBus) -> usize {
+        mock.sent
+            .lock()
+            .expect("sent lock")
+            .iter()
+            .filter(|f| can_id_parts(f.arbitration_id).msg_type == MsgType::QueryPosVel as u8)
+            .count()
+    }
+
+    #[test]
+    fn warmup_attempt_cap_stays_bounded() {
+        // 500 ms of budget, 50 ms per probe: ten attempts, plus the two extra rounds the
+        // attempt window itself needs.
+        assert_eq!(
+            warmup_attempt_cap(Duration::from_millis(500), Duration::from_millis(50)),
+            12
+        );
+        assert_eq!(
+            warmup_attempt_cap(Duration::from_millis(50), Duration::from_millis(50)),
+            3
+        );
+        // The reason the cap exists: a clock that does not advance must still leave a
+        // finite number of probes, and a zero attempt window must not divide by zero.
+        assert_eq!(
+            warmup_attempt_cap(Duration::from_millis(500), Duration::ZERO),
+            502
+        );
+        assert_eq!(warmup_attempt_cap(Duration::ZERO, Duration::ZERO), 2);
+        // A budget that can never expire saturates rather than wrapping around.
+        assert_eq!(
+            warmup_attempt_cap(Duration::from_secs(u64::MAX / 4), WARMUP_ATTEMPT),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn warm_up_does_not_accept_a_stale_answer() {
+        // A response from *before* the probe is not an answer to it. Without that rule a
+        // link that had ever answered -- and every session does, for the descriptor or for
+        // an earlier query -- would look warm while nothing was actually getting through.
+        let (mock, motor) = mock_motor();
+        motor
+            .process_feedback_frame(CanFrame {
+                arbitration_id: make_can_id(6, MsgType::QueryPosVel as u8, 0x01, 0x01, 0),
+                data: [0; 8],
+                dlc: 8,
+                is_extended: true,
+                is_rx: true,
+            })
+            .unwrap();
+        assert!(motor.answered_since(
+            MsgType::QueryPosVel as u8,
+            Instant::now() - Duration::from_secs(1)
+        ));
+
+        // The bus then goes quiet: the old frame must not satisfy the new probe.
+        let err = motor
+            .warm_up(Duration::from_millis(200))
+            .expect_err("a stale answer is not an answer")
+            .to_string();
+        assert!(err.contains("session warm-up"), "{err}");
+        assert!(probes_sent(&mock) >= 2, "and the probe was re-sent");
+    }
+
+    #[test]
+    fn heartbeat_alone_does_not_count_as_an_answer() {
+        // The whole point of the observable: a periodic heartbeat says nothing about the
+        // transmit path, so it must not be mistaken for a reply to our request.
+        let motor = make_motor();
+        let asked_at = Instant::now();
+        let heartbeat = CanFrame {
+            arbitration_id: make_can_id(6, MsgType::Heartbeat as u8, 0x01, 0x01, 0),
+            data: [0xE0, 0x13, 0x4E, 0, 0, 0, 0, 0],
+            dlc: 8,
+            is_extended: true,
+            is_rx: true,
+        };
+        motor.process_feedback_frame(heartbeat).unwrap();
+        assert!(motor.latest_state().is_some(), "the heartbeat is decoded");
+        assert!(!motor.answered_since(MsgType::QueryPosVel as u8, asked_at));
+
+        // A QUERY_POS_VEL reply, on the other hand, is exactly what the warm-up waits for.
+        let reply = CanFrame {
+            arbitration_id: make_can_id(6, MsgType::QueryPosVel as u8, 0x01, 0x01, 0),
+            data: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            dlc: 8,
+            is_extended: true,
+            is_rx: true,
+        };
+        motor.process_feedback_frame(reply).unwrap();
+        assert!(motor.answered_since(MsgType::QueryPosVel as u8, asked_at));
+        // ... and only for its own message type.
+        assert!(!motor.answered_since(MsgType::QueryStatus as u8, asked_at));
+    }
+
+    #[test]
+    fn warm_up_re_sends_the_probe_and_reports_that_nothing_answered() {
+        // Nothing on an empty mock bus answers, so the probe must be re-sent (that is the
+        // mechanism a lost first frame needs) and then reported honestly -- never as
+        // success, and bounded so it cannot spin.
+        let (mock, motor) = mock_motor();
+        let err = motor
+            .warm_up(Duration::from_millis(200))
+            .expect_err("an empty bus answers nothing")
+            .to_string();
+        assert!(err.contains("session warm-up"), "{err}");
+        assert!(err.contains("QUERY_POS_VEL"), "{err}");
+        assert!(err.contains("0x01"), "the node is named: {err}");
+        let probes = probes_sent(&mock);
+        assert!(probes >= 2, "the probe must be re-sent, got {probes}");
+        assert!(probes <= 6, "and be bounded, got {probes}");
+        assert_eq!(motor.tx_retries(), probes as u32 - 1);
     }
 
     #[test]

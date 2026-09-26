@@ -293,6 +293,55 @@ SDK 侧已同步：
 
 ---
 
+### 4.4 slcan「首帧丢失」在 motorbridge 上的复现尝试（结论：不是本仓库的机制）
+
+起因：台架上一度看到「`--mode mit --no-endpoint-map` 的 StartMotor 不在总线上」，
+据此推断「slcan 适配器打开端口时重置输入缓冲、丢掉会话头一两帧」；JointSDK 正是这个现象
+（`jsdk_context_warmup`，实测 acks/nacks 恒 0 ⇒ 主机侧无信号），所以先按它的做法查。
+
+实测结论（2026-09-26）：
+
+| 检查 | 结果 |
+|---|---|
+| 20 轮 `--mode status --no-endpoint-map --trace` + 限时 `candump`，看会话**第一帧**是否上线 | **20/20 都在总线上**（`on_bus=yes`）⇒ 本台架复现不出首帧丢失 |
+| 之前那次「StartMotor 不在总线上」 | **我自己的 grep 错了**：29-bit id 带 `Seq[1:0]`，实测该帧是 `0D880406`（seq=2），我却按字面量 `0D880404` 找 ⇒ 假阴性 |
+| 机制差异 | JointSDK 的 HAL **每次会话自己开串口**（Lawicel ASCII 帧）；motorbridge 走 **SocketCAN**（`slcand` 长期持有串口，会话只是新建 socket）⇒ 那头一两帧的窗口在本仓库不存在。本仓 transport 只有 socketcan/socketcanfd/pcan/dm-device/dm-serial |
+
+因此**只借鉴了 JointSDK 里真正适用的那一半**：
+
+* **幂等请求 + 重发**（`3801bc3` / `d782108`）—— 这才是丢帧问题的通用解，而丢帧在本台架
+  真实存在（用户当初 ~1/10 的连接失败就是一个丢掉的 descriptor 分片造成的）。落地：
+  * `CyberBeastMotor::warm_up(500ms)`：发 `QUERY_POS_VEL`（只读、幂等），每轮等
+    `WARMUP_ATTEMPT(50ms)`，没答就重发；成功后再调是空操作；**只有新鲜回答**才算数
+    （陈旧回答不算，`since` 检查）；失败返回 `Timeout`（**绝不报成功**）；除时间预算外
+    另有**轮次上限**（`预算/50 + 2`），时钟不前进也不会死循环；重发次数记入 `tx_retries()`。
+  * CLI：`--no-endpoint-map` 时在模式发第一帧之前预热（有端点表时不需要：descriptor
+    传输本身就是会话的前几十帧、而且它自带按 offset 重发）；`--mode reset` 在发 0x64 前
+    也预热（否则「复位发出去了」可能根本没上线）；**`estop` 明确跳过**（广播急停不能等
+    500 ms，`jsdk_ctx_send_raw` 同理）。
+  * `read_param_raw`：请求没答 → 在调用方 timeout 内重发（仅当**该 offset 完全没有回答**时
+    才重发，避免把慢到的回答与重发的回答叠在一起——响应里不带 offset，无法区分重复分片；
+    真出现重复时 `decode_value` 会按声明的宽度报 `Protocol` 错误，不会返回错值）。
+* **观测**：`tx_retries()`（预热 + 读重发），`read-param` 在非 0 时打印一行，CLI 预热非 0 时
+  打印「session warm-up: N probe(s) re-sent」。
+
+验证（离线注入，`motor_vendors/cyberbeast/tests/endpoint_map_integration.rs` + 单元测试）：
+
+* 仿真器新增 `drophead=N`（丢掉主站最前面 N 帧，JointSDK 同名故障注入）与
+  「第 N 个 PARAM_READ 回答不上线」两种注入；
+* 用例：丢 1..3 帧 → 预热重发次数 == N，且**之后那条真正重要的读仍然成功且值正确**；
+  健康链路 1 次到位、重复调用零帧；只有心跳不算回答；陈旧回答不算回答；全丢 → 有界重发后
+  `Timeout` 且报文含节点号；单次丢掉 **param 回答** → 重发后拿到正确值；丢掉分段读的
+  **续读回答** → 同 offset 重发、拼出的值仍是设备给的值；节点彻底不答 → 报超时而不是编字节；
+* 变异测试（`tools/mutate_warmup.sh`）：关掉重发、关掉读重试、去掉新鲜度检查、去掉
+  「已预热即空操作」四处变异**都被用例检出**；另有一处（`record_response` 不过滤心跳）
+  在**当前用法下等价**（读取侧也按 msg_type 匹配），脚本里如实标注为“测不出来”，
+  没有把它当成测试的功劳。
+
+真机复验（本轮）：`--mode status --no-endpoint-map` 首帧即预热探针 `0x15040404`、
+20 轮 0 次丢帧/0 次重发；`read-param`（带表）输出与改动前逐字相同、无重发行；
+`--mode reset --yes` 复位后标定/配置标志仍全为 true。
+
 ## 5. 需要厂商确认的两个“语义边界”（不是 bug，但影响上位机实现）
 
 1. **电机端 vs 输出端**：文档 4.1.1 说明 MIT/POS/VEL 命令为**输出端**单位（固件内部 `× gear_ratio / 2π`），
