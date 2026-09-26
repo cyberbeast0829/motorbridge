@@ -12,9 +12,14 @@
 //! reading the device's own descriptor (see `REGISTER_TABLE`).
 //!
 //! This module provides a minimal static table of **verified** endpoint ids for
-//! documentation and tooling. For complete parameter access, use the dynamic JSON
-//! descriptor mechanism (protocol 4.8: `JSON_DESC_READ` 0x24 / `JSON_DESC_DATA` 0x25;
-//! `tools/cb_json_probe.py` fetches and dumps it).
+//! documentation and tooling. For the complete map, read the device's own descriptor
+//! at runtime instead of extending this table by hand (protocol 4.8,
+//! `JSON_DESC_READ` 0x24 / `JSON_DESC_DATA` 0x25):
+//!
+//! - Rust: `CyberBeastMotor::read_endpoint_descriptor()` (text) or
+//!   `read_endpoint_descriptor_raw()` (bytes + `TotalLength` + `VersionCRC`)
+//! - CLI: `motor_cli --vendor cyberbeast --channel <ch> --mode endpoint-map --out map.json`
+//! - Cross-check: `tools/cb_json_probe.py` (raw SocketCAN, no SDK) returns the same JSON
 
 #[derive(Debug, Clone, Copy)]
 pub struct RegisterInfo {

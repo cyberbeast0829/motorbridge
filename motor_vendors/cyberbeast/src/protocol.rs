@@ -322,6 +322,13 @@ pub fn f32_to_big_endian_bytes(val: f32, buf: &mut [u8], offset: usize) {
 // Float/int range mapping (replicates ODrive float_to_uint / uint_to_float)
 // ============================================================================
 
+/// Replicates the firmware's `float_to_uint()`: conversion uses a C-style cast,
+/// i.e. **truncation toward zero, not rounding**.
+///
+/// Protocol 4.1.1 states this explicitly and gives the example that `pos = 0`
+/// with `mit_max_pos = 12.5` encodes to `0x7FFF`, not `0x8000`. The device's own
+/// MIT responses show the same mid-range value (`7F FF ...`), so rounding would be
+/// off by 1 LSB at the mid-point.
 fn float_to_uint(x: f32, x_min: f32, x_max: f32, bits: u32) -> u32 {
     let span = x_max - x_min;
     if span <= 0.0 {
@@ -329,7 +336,9 @@ fn float_to_uint(x: f32, x_min: f32, x_max: f32, bits: u32) -> u32 {
     }
     let max_val = (1u32 << bits) - 1;
     let clamped = x.clamp(x_min, x_max);
-    ((clamped - x_min) / span * max_val as f32).round() as u32
+    // `as u32` truncates toward zero and saturates; the firmware's `(int)` cast
+    // behaves the same way for the clamped, non-negative intermediate value.
+    ((clamped - x_min) / span * max_val as f32) as u32
 }
 
 fn uint_to_float(x_int: u32, x_min: f32, x_max: f32, bits: u32) -> f32 {
@@ -917,6 +926,74 @@ pub fn encode_config_reset() -> [u8; 8] {
     [0u8; 8]
 }
 
+// ============================================================================
+// JSON_DESC_READ (0x24) / JSON_DESC_DATA (0x25) — endpoint descriptor transfer
+// (protocol 4.8)
+//
+// The device answers with one metadata frame followed by N data frames:
+//   metadata: [0x00, 0x00] | TotalLength (u32 **little-endian**) | VersionCRC (u16 LE)
+//   data:     ChunkOffset (u16 **little-endian**) | JSON bytes (6 per classic-CAN frame)
+//
+// The host walks the transfer with `Offset` (u32 **little-endian**) until it has
+// TotalLength bytes. The device sends at most 50 frames per cycle, and a repeat
+// request at the end of those 50 frames continues the transfer.
+// ============================================================================
+
+/// JSON bytes carried by one classic-CAN data frame (8 - 2 offset bytes).
+pub const JSON_DESC_BYTES_PER_CLASSIC_FRAME: usize = 6;
+
+/// Encode a JSON_DESC_READ request for a byte offset inside the descriptor.
+///
+/// Note the offset is **little-endian** here (protocol 4.8), unlike PARAM_READ's
+/// big-endian offset.
+pub fn encode_json_desc_read(offset: u32) -> [u8; 8] {
+    let mut buf = [0u8; 8];
+    buf[0..4].copy_from_slice(&offset.to_le_bytes());
+    buf
+}
+
+/// Upper bound for a JSON descriptor transfer: the tested firmware sends 38433
+/// bytes. Also used to tell the metadata frame apart from a data frame.
+pub const JSON_DESC_MAX_BYTES: usize = 512 * 1024;
+
+/// Decode the JSON_DESC metadata frame into `(TotalLength, VersionCRC)`.
+///
+/// Returns `None` when the frame cannot be metadata. That check is the only way to
+/// tell the metadata frame from a data frame at offset 0, whose first two bytes are
+/// `0x00 0x00` as well: a data frame carries JSON text from byte 2 on, and those four
+/// bytes read as a little-endian `u32` are far larger than any real descriptor.
+/// The device also repeats the metadata frame after every continuation request, so
+/// callers must ignore metadata whenever it appears, not only at the start.
+pub fn decode_json_desc_meta(data: &[u8]) -> Option<(u32, u16)> {
+    if data.len() < 8 || data[0] != 0x00 || data[1] != 0x00 {
+        return None;
+    }
+    let total_len = u32::from_le_bytes([data[2], data[3], data[4], data[5]]);
+    if !(64..=JSON_DESC_MAX_BYTES as u32).contains(&total_len) {
+        return None;
+    }
+    let version_crc = u16::from_le_bytes([data[6], data[7]]);
+    Some((total_len, version_crc))
+}
+
+/// A JSON_DESC data frame: the byte offset it carries plus its JSON bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct JsonDescChunk<'a> {
+    pub offset: u16,
+    pub data: &'a [u8],
+}
+
+/// Decode a JSON_DESC data frame (`ChunkOffset` u16 little-endian + JSON bytes).
+pub fn decode_json_desc_chunk(data: &[u8]) -> Option<JsonDescChunk<'_>> {
+    if data.len() < 3 {
+        return None;
+    }
+    Some(JsonDescChunk {
+        offset: u16::from_le_bytes([data[0], data[1]]),
+        data: &data[2..],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1035,12 +1112,53 @@ mod tests {
     }
 
     #[test]
-    fn test_pack_unpack_mit_zero_values() {
+    fn test_pack_mit_zero_values_truncate_like_the_firmware() {
+        // Protocol 4.1.1: the firmware converts with a C-style cast (truncation),
+        // so zero position over +/-12.5 rad encodes to 32767 (0x7FFF), not 0x8000.
         let params = MitCommandParams::default();
         let packed = pack_mit_command(&params, 12.5, 50.0, 500.0, 100.0, 10.0);
-        // Zero pos → mid-range uint16 (0x8000), zero vel/kp/kd/torque → mid-range
-        assert_eq!(packed[0], 0x80);
-        assert_eq!(packed[1], 0x00);
+        assert_eq!(packed[0], 0x7F);
+        assert_eq!(packed[1], 0xFF);
+        // vel = 0 over [-50, +50] → 2047.5 → 2047 (0x7FF).
+        assert_eq!(packed[2], 0x7F);
+        assert_eq!(packed[3] & 0xF0, 0xF0);
+        // kp is zero-fed, so its nibble must stay zero.
+        assert_eq!(packed[3] & 0x0F, 0x00);
+
+        // Round-trip: truncation must not shift the decoded command noticeably.
+        let unpacked = unpack_mit_command(&packed, 12.5, 50.0, 500.0, 100.0, 10.0);
+        assert!(unpacked.pos.abs() < 0.001, "pos={}", unpacked.pos);
+        assert!(unpacked.vel.abs() < 0.05, "vel={}", unpacked.vel);
+    }
+
+    #[test]
+    fn test_json_desc_request_uses_little_endian_offset() {
+        // Protocol 4.8: the descriptor offset is little-endian (unlike PARAM_READ).
+        assert_eq!(encode_json_desc_read(0), [0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(encode_json_desc_read(300), [0x2C, 0x01, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_decode_json_desc_meta_and_chunks() {
+        // Captured on hardware: TotalLength = 38433, VersionCRC = 0x3F82.
+        let meta = [0x00, 0x00, 0x21, 0x96, 0x00, 0x00, 0x82, 0x3F];
+        assert_eq!(decode_json_desc_meta(&meta), Some((38433, 0x3F82)));
+
+        // A data frame at offset 0 starts with the JSON itself, so it is not metadata.
+        let first_chunk = [0x00, 0x00, b'{', b'"', b'e', b'n', b'd', b'p'];
+        assert_eq!(decode_json_desc_meta(&first_chunk), None);
+        let chunk = decode_json_desc_chunk(&first_chunk).expect("valid chunk");
+        assert_eq!(chunk.offset, 0);
+        assert_eq!(chunk.data, b"{\"endp");
+
+        // Later chunks carry their own little-endian offset.
+        let later = [0x2C, 0x01, b'x', b'y', b'z', b'1', b'2', b'3'];
+        let chunk = decode_json_desc_chunk(&later).expect("valid chunk");
+        assert_eq!(chunk.offset, 300);
+        assert_eq!(chunk.data, b"xyz123");
+
+        // Too short to be a data frame.
+        assert!(decode_json_desc_chunk(&[0x01, 0x02]).is_none());
     }
 
     #[test]

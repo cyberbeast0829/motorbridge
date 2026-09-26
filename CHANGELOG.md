@@ -21,6 +21,11 @@ Versioning.
   - Python CLI support: `--vendor cyberbeast` for `run` (all four unified modes,
     `read-param` / `write-param`, `save`, `set-zero`) and `scan`.
   - `bindings/python/examples/cyberbeast_demo.py`.
+- CyberBeast JSON endpoint descriptor access (protocol 4.8):
+  `CyberBeastMotor::read_endpoint_descriptor()` / `read_endpoint_descriptor_raw()` and
+  `motor_cli --mode endpoint-map [--out <path>] [--dump]`, so the device's own
+  endpoint map (554 entries on the tested firmware, 38433 bytes) can be fetched
+  instead of relying on a hand-maintained table.
 
 ### Fixed
 
@@ -46,6 +51,12 @@ Versioning.
     `StartMotor`/`StopMotor`), control loops send `StopMotor` on Ctrl+C, and
     `estop` / `clear-error` / `set-zero` / `read-param` / `write-param` /
     `monitor` / `keep-alive` modes plus `--trace` frame dumps were added.
+  - MIT command encoding truncates toward zero like the firmware
+    (`pos = 0` over ±12.5 rad encodes to `0x7FFF`, not `0x8000`) instead of rounding
+    up by 1 LSB; protocol v2.5 documents the cast explicitly.
+  - the JSON descriptor transfer ignores repeated metadata frames and requests the
+    next chunk only after the device stops streaming, which is what makes
+    `--mode endpoint-map` produce the same bytes as the independent probe.
 
 ## [0.4.9] - 2026-07-06
 

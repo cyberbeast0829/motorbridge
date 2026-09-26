@@ -752,6 +752,35 @@ pub fn run_cyberbeast(
             ctrl.shutdown()?;
         }
 
+        // Read-only: fetch the device's own endpoint descriptor (protocol 4.8).
+        "endpoint-map" => {
+            let motor = ctrl.add_motor(motor_id, motor_id, model)?;
+            let timeout_ms = get_u64(args, "timeout-ms", 500)?;
+            println!(
+                "fetching the JSON endpoint descriptor from 0x{motor_id:02X} (JSON_DESC_READ 0x24 / JSON_DESC_DATA 0x25), stall window {timeout_ms} ms"
+            );
+            let (total_len, version_crc, json) =
+                motor.read_endpoint_descriptor(Duration::from_millis(timeout_ms))?;
+            println!(
+                "  descriptor: {total_len} bytes, VersionCRC=0x{version_crc:04X}, {} \"id\" occurrences",
+                json.matches("\"id\"").count()
+            );
+            match args.get("out") {
+                Some(path) => {
+                    std::fs::write(path, json.as_bytes())
+                        .map_err(|err| format!("cannot write {path}: {err}"))?;
+                    println!("  wrote {path}");
+                }
+                None => {
+                    println!("  (use --out <path> to save the JSON, or --dump to print it here)")
+                }
+            }
+            if args.contains_key("dump") {
+                print!("{json}");
+            }
+            ctrl.shutdown()?;
+        }
+
         // Passive link/state monitor: never transmits a frame.
         "monitor" => {
             let motor = ctrl.add_motor(motor_id, motor_id, model)?;
@@ -873,7 +902,7 @@ pub fn run_cyberbeast(
 
         other => {
             eprintln!(
-                "unknown mode: {other}. Supported: scan, status, mit, pos, vel, torque, enable, disable, estop, clear-error, set-zero, read-param, write-param, monitor, keep-alive"
+                "unknown mode: {other}. Supported: scan, status, mit, pos, vel, torque, enable, disable, estop, clear-error, set-zero, read-param, write-param, endpoint-map, monitor, keep-alive"
             );
             ctrl.shutdown()?;
         }

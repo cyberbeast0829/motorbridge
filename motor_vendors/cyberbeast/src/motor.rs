@@ -1,9 +1,9 @@
 use crate::protocol::{
     self, can_id_parts, encode_clear_errors, encode_config_save, encode_current_control,
-    encode_param_read_at, encode_param_write, encode_pos_control, encode_set_zero,
-    encode_torque_control, encode_vel_control, make_can_id, pack_mit_command, seq_next,
-    unpack_mit_response, CyberBeastCanId, MitCommandParams, MsgType, Priority, ADDR_BROADCAST,
-    DEFAULT_MASTER_ID, MAX_BROADCAST_DEVICES,
+    encode_json_desc_read, encode_param_read_at, encode_param_write, encode_pos_control,
+    encode_set_zero, encode_torque_control, encode_vel_control, make_can_id, pack_mit_command,
+    seq_next, unpack_mit_response, CyberBeastCanId, MitCommandParams, MsgType, Priority,
+    ADDR_BROADCAST, DEFAULT_MASTER_ID, MAX_BROADCAST_DEVICES,
 };
 use motor_core::bus::{CanBus, CanFrame};
 use motor_core::device::MotorDevice;
@@ -142,6 +142,52 @@ impl ParamCache {
     }
 }
 
+/// Accumulates a JSON endpoint descriptor transfer (protocol 4.8).
+#[derive(Debug, Default)]
+struct JsonDescCache {
+    /// `TotalLength` from the metadata frame, once seen.
+    total_len: Option<u32>,
+    /// `VersionCRC` from the metadata frame, once seen.
+    version_crc: Option<u16>,
+    /// Descriptor bytes assembled so far, positioned by `ChunkOffset`.
+    bytes: Vec<u8>,
+}
+
+impl JsonDescCache {
+    /// Start a new transfer.
+    fn reset(&mut self) {
+        self.total_len = None;
+        self.version_crc = None;
+        self.bytes.clear();
+    }
+
+    /// Record one response frame; returns `true` when the frame was consumed.
+    ///
+    /// The device repeats the metadata frame after every continuation request, so
+    /// metadata is filtered out at any point instead of only at the beginning.
+    fn record(&mut self, data: &[u8]) -> bool {
+        if let Some((total_len, version_crc)) = protocol::decode_json_desc_meta(data) {
+            if self.total_len.is_none() {
+                self.total_len = Some(total_len);
+                self.version_crc = Some(version_crc);
+            }
+            return true;
+        }
+        let Some(chunk) = protocol::decode_json_desc_chunk(data) else {
+            return false;
+        };
+        let start = chunk.offset as usize;
+        if start + chunk.data.len() > protocol::JSON_DESC_MAX_BYTES {
+            return false;
+        }
+        if self.bytes.len() < start + chunk.data.len() {
+            self.bytes.resize(start + chunk.data.len(), 0);
+        }
+        self.bytes[start..start + chunk.data.len()].copy_from_slice(chunk.data);
+        true
+    }
+}
+
 // ============================================================================
 // Default MIT limits (ODrive CyberBeast defaults, per protocol v2.4)
 // ============================================================================
@@ -159,6 +205,9 @@ const MAX_MIT_CURRENT_RANGE_A: f32 = 80.0;
 /// Endpoint ids verified against the device descriptor; see [`crate::registers::REGISTER_TABLE`].
 const ENDPOINT_MIT_MAX_TORQUE: u16 = 0x0151;
 const ENDPOINT_MOTOR_TORQUE_CONSTANT: u16 = 0x00F7;
+
+/// Upper bound on continuation requests for one descriptor transfer.
+const MAX_JSON_DESC_REQUESTS: u32 = 64;
 
 /// MIT response current range: `mit_max_torque / torque_constant`, clamped to 80 A.
 ///
@@ -344,6 +393,8 @@ pub struct CyberBeastMotor {
     mit_current_limit: AtomicU32,
     /// Parameter cache for SDO endpoint read/write operations.
     param_cache: Mutex<ParamCache>,
+    /// JSON endpoint descriptor transfer state (protocol 4.8).
+    json_desc: Mutex<JsonDescCache>,
 }
 
 impl CyberBeastMotor {
@@ -372,6 +423,7 @@ impl CyberBeastMotor {
             mit_torque_limit: DEFAULT_MIT_TORQUE_LIMIT,
             mit_current_limit: AtomicU32::new(DEFAULT_MIT_CURRENT_LIMIT.to_bits()),
             param_cache: Mutex::new(ParamCache::new()),
+            json_desc: Mutex::new(JsonDescCache::default()),
         })
     }
 
@@ -741,6 +793,91 @@ impl CyberBeastMotor {
         Ok(f32::from_le_bytes(raw))
     }
 
+    /// Send a JSON_DESC_READ request for a descriptor byte offset (protocol 4.8).
+    pub fn send_json_desc_read(&self, offset: u32) -> Result<()> {
+        let data = encode_json_desc_read(offset);
+        let can_id = self.cmd_can_id(Priority::Config, MsgType::JsonDescRead);
+        self.send_ext(can_id, data)
+    }
+
+    /// Fetch the device's JSON endpoint descriptor and return it as text.
+    ///
+    /// Returns `(total_len, version_crc, json)`; see
+    /// [`Self::read_endpoint_descriptor_raw`] for the raw bytes.
+    pub fn read_endpoint_descriptor(&self, timeout: Duration) -> Result<(u32, u16, String)> {
+        let (total_len, version_crc, bytes) = self.read_endpoint_descriptor_raw(timeout)?;
+        let json = String::from_utf8(bytes).map_err(|err| {
+            MotorError::Protocol(format!("endpoint descriptor is not valid UTF-8: {err}"))
+        })?;
+        Ok((total_len, version_crc, json))
+    }
+
+    /// Fetch the device's JSON endpoint descriptor as raw bytes.
+    ///
+    /// Sends `JSON_DESC_READ` (0x24) and reassembles the `JSON_DESC_DATA` (0x25)
+    /// frames: one metadata frame plus chunks of 6 JSON bytes. The device streams a
+    /// large burst for a single request, so a continuation request is only sent once
+    /// the device has gone quiet for `timeout` and the descriptor is still incomplete.
+    /// `timeout` therefore bounds the quiet window, not the whole transfer.
+    pub fn read_endpoint_descriptor_raw(&self, timeout: Duration) -> Result<(u32, u16, Vec<u8>)> {
+        {
+            let mut cache = self
+                .json_desc
+                .lock()
+                .map_err(|_| MotorError::Io("json descriptor lock poisoned".into()))?;
+            cache.reset();
+        }
+        self.send_json_desc_read(0)?;
+
+        let mut last_received = 0usize;
+        let mut quiet_deadline = Instant::now() + timeout;
+        let mut requests = 1u32;
+        loop {
+            let (received, total_len) = {
+                let cache = self
+                    .json_desc
+                    .lock()
+                    .map_err(|_| MotorError::Io("json descriptor lock poisoned".into()))?;
+                (cache.bytes.len(), cache.total_len)
+            };
+            if let Some(total_len) = total_len {
+                if received >= total_len as usize {
+                    break;
+                }
+            }
+            if received > last_received {
+                // Still streaming: keep the window open.
+                last_received = received;
+                quiet_deadline = Instant::now() + timeout;
+            } else if Instant::now() > quiet_deadline {
+                if requests >= MAX_JSON_DESC_REQUESTS {
+                    return Err(MotorError::Timeout(format!(
+                        "endpoint descriptor transfer gave up after {requests} requests ({received} of {} bytes)",
+                        total_len.unwrap_or(0)
+                    )));
+                }
+                requests += 1;
+                self.send_json_desc_read(received as u32)?;
+                quiet_deadline = Instant::now() + timeout;
+            }
+            std::thread::sleep(Duration::from_millis(PARAM_POLL_INTERVAL_MS));
+        }
+
+        let (total_len, version_crc, bytes) = {
+            let cache = self
+                .json_desc
+                .lock()
+                .map_err(|_| MotorError::Io("json descriptor lock poisoned".into()))?;
+            (
+                cache.total_len.unwrap_or(0),
+                cache.version_crc.unwrap_or(0),
+                cache.bytes.clone(),
+            )
+        };
+        let bytes = bytes[..total_len as usize].to_vec();
+        Ok((total_len, version_crc, bytes))
+    }
+
     /// Current range used to decode MIT response current values (A).
     pub fn mit_current_limit(&self) -> f32 {
         f32::from_bits(self.mit_current_limit.load(Ordering::Relaxed))
@@ -1034,6 +1171,15 @@ impl CyberBeastMotor {
                 }
             }
 
+            // JSON_DESC_DATA: descriptor metadata frame or one descriptor chunk
+            t if t == MsgType::JsonDescData as u8 => {
+                let mut cache = self
+                    .json_desc
+                    .lock()
+                    .map_err(|_| MotorError::Io("json descriptor lock poisoned".into()))?;
+                cache.record(&frame.data);
+            }
+
             _ => {
                 // Unknown response — ignore
             }
@@ -1131,6 +1277,27 @@ mod tests {
         assert_eq!(mit_current_range_from(0.0, 0.1), None);
         assert_eq!(mit_current_range_from(f32::NAN, 1.0), None);
         assert_eq!(mit_current_range_from(1.0, f32::INFINITY), None);
+    }
+
+    #[test]
+    fn json_desc_cache_assembles_metadata_and_chunks() {
+        // Frames captured on hardware: metadata first, then 6-byte JSON chunks.
+        let mut cache = JsonDescCache::default();
+        cache.reset();
+        let meta = [0x00, 0x00, 0x21, 0x96, 0x00, 0x00, 0x82, 0x3F];
+        assert!(cache.record(&meta));
+        assert_eq!(cache.total_len, Some(38433));
+        assert_eq!(cache.version_crc, Some(0x3F82));
+
+        assert!(cache.record(&[0x00, 0x00, b'{', b'"', b'a', b'b', b'c', b'd']));
+        assert!(cache.record(&[0x06, 0x00, b'e', b'f', b'g', b'h', b'i', b'j']));
+        assert_eq!(&cache.bytes, b"{\"abcdefghij");
+
+        // The device repeats the metadata frame after a continuation request; it
+        // must never be stored as descriptor bytes (that would overwrite the start).
+        assert!(cache.record(&meta));
+        assert_eq!(&cache.bytes, b"{\"abcdefghij");
+        assert_eq!(cache.total_len, Some(38433));
     }
     use motor_core::bus::{CanBus, CanFrame};
     use motor_core::test_support::MockBus;

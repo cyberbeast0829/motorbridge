@@ -23,9 +23,14 @@
 
 ---
 
-## 1. ⚠ PARAM_READ (0x20) 的 **value 字节序：文档写大端，固件是小端**
+## 1. ✅ PARAM_READ (0x20) 的 **value 字节序：v2.5 已澄清为小端（本项已关闭）**
 
-**文档 4.7**：
+> **状态：已关闭（2026-09-25）** —— 厂商文档 **v2.5** 已把 PARAM_READ/PARAM_WRITE 的
+> **参数值明确为 Little-Endian**，并补充了 4.7 节的字节序说明、自检顺序与示例；
+> 同时明确 JSON 描述符（4.8）的 Offset / TotalLength / VersionCRC / ChunkOffset 也为小端。
+> SDK 实现与 v2.5 一致，**无需再向厂商确认**。
+
+**（历史记录）当时文档 4.7 写的是**：
 ```
 响应:
 Byte 4..:   [Value]           (DataLen 字节, Big-Endian)
@@ -48,6 +53,22 @@ Byte 4..:   [Value]           (DataLen 字节, Big-Endian)
 
 **请厂商确认**：响应 value 是否应改为大端（与文档一致），还是文档应更正为小端（与固件一致）？
 SDK 已按**实测小端**实现，并在两个 crate 的注释里写明了该差异。
+
+### 1.1 ⚠ MIT 命令的取整方式：v2.5 明确为「向零截断」（SDK 原先用四舍五入，已修）
+
+**文档 v2.5 4.1.1（新增说明）**：
+```
+int_val = clamp(trunc((float_val - offset) / span * (2^bits - 1)), 0, 2^bits-1)
+```
+> ⚠ 取整方式 = 向零截断 (C 式 `(int)`)，不是四舍五入。例如 `pos=0` / `mit_max_pos=12.5`
+> 编码为 `32767 (0x7FFF)` 而非 `32768 (0x8000)`。
+
+**真机印证**：设备 idle 时对 `QUERY_STATUS (0x40)` 回的 MIT 响应帧为
+`7F FF 7F F0 80 02 4E 50` → `p_int = 0x7FFF`（若按四舍五入应为 `0x8000`）。
+
+**SDK 修复**：`float_to_uint()` 去掉 `.round()`，改为 `as u32`（向零截断），并加守卫测试
+（断言 `pos=0` → `0x7FFF`，且往返误差 < 1e-3 rad）。影响：此前中位附近有 1 LSB 偏差
+（4π 量程下约 0.0004 rad），现与固件一致。
 
 ---
 
@@ -76,6 +97,14 @@ SDK 已按**实测小端**实现，并在两个 crate 的注释里写明了该�
 **请厂商确认**：
 1. 是否有**官方**的“端点 ID ↔ 名称/类型”表可供 SDK 内置（而不是只能运行时从描述符解析）？
 2. 描述符 `VersionCRC` 变化时，主站应如何判断“端点映射已变、需重新拉取”（推荐做法）？
+
+**SDK 现状（2026-09-25）**：已实现描述符读取，不再依赖外部脚本：
+
+- Rust: `CyberBeastMotor::read_endpoint_descriptor(timeout)` /
+  `read_endpoint_descriptor_raw(timeout)`（协议 4.8，含元数据帧重复出现与续传处理）
+- CLI: `motor_cli --vendor cyberbeast --channel slcan0 --motor-id 1 --mode endpoint-map [--out map.json] [--dump]`
+- 真机结果：`38433 bytes, VersionCRC=0x3F82, 554 个 "id"`；与独立实现
+  （`tools/cb_json_probe.py`，裸 SocketCAN 直接收发）解析后的 JSON **结构完全一致**
 
 ---
 
